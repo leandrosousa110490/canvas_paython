@@ -125,20 +125,42 @@ class CustomGraphicsView(QGraphicsView):
         
         if event.button() == Qt.MouseButton.LeftButton:
             self.start_pos_scene = self.mapToScene(event.position().toPoint())
+            item_at_click = self.itemAt(event.position().toPoint())
+
+            # Check for crop handle interaction first, as it takes precedence if active
+            if self.parent_window.current_crop_item and item_at_click and hasattr(item_at_click, 'is_crop_handle'):
+                # Ensure the handle belongs to the active crop_overlay_rect
+                if item_at_click.parentItem() == self.parent_window.crop_overlay_rect:
+                    self.item_being_resized = self.parent_window.crop_overlay_rect # We are resizing the crop overlay
+                    self.current_resize_handle_type = item_at_click.handle_type # e.g., "se_crop"
+                    self.resize_start_pos_scene = self.start_pos_scene
+                    self.original_item_rect_on_resize_start = self.parent_window.crop_overlay_rect.rect() # Crop rect in its own coords
+                    event.accept()
+                    return
 
             if tool == "select":
-                item_at_click = self.itemAt(event.position().toPoint())
-                if item_at_click and hasattr(item_at_click, 'is_resize_handle'): # Check if it's one of our handles
-                    self.item_being_resized = item_at_click.parentItem()
-                    self.current_resize_handle_type = item_at_click.handle_type
-                    self.resize_start_pos_scene = self.start_pos_scene # Use mapped scene coords
-                    if self.item_being_resized: # Ensure parent is valid
-                        self.original_item_rect_on_resize_start = self.item_being_resized.rect()
-                    else: # Should not happen if handle is correctly parented
-                        self.current_resize_handle_type = None 
+                # item_at_click is already fetched
+                if item_at_click and hasattr(item_at_click, 'is_resize_handle'): # Check if it's one of our item resize handles
+                    # Ensure it belongs to the currently selected_item if one exists
+                    if self.parent_window.selected_item and item_at_click.parentItem() == self.parent_window.selected_item:
+                        self.item_being_resized = item_at_click.parentItem()
+                        self.current_resize_handle_type = item_at_click.handle_type
+                        self.resize_start_pos_scene = self.start_pos_scene
+                        if self.item_being_resized:
+                            if isinstance(self.item_being_resized, QGraphicsPixmapItem):
+                                self.original_item_rect_on_resize_start = self.item_being_resized.boundingRect()
+                            else: # RectItem, EllipseItem
+                                self.original_item_rect_on_resize_start = self.item_being_resized.rect()
+                        else:
+                            self.current_resize_handle_type = None
+                            super().mousePressEvent(event) # Fallback
+                            return
+                        event.accept()
                         return
-                    event.accept()
-                    return # Handled resize press
+                    else:
+                         # Clicked a resize handle for a non-selected item, or no item selected
+                        super().mousePressEvent(event) # Let base class handle it (might select the item)
+                        return 
                 else:
                     # If not on a handle, let the base class handle selection/movement
                     super().mousePressEvent(event)
@@ -182,38 +204,123 @@ class CustomGraphicsView(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         tool = self.parent_window.current_tool
-        current_pos_scene = self.mapToScene(event.position().toPoint()) # Define here for general access
+        current_pos_scene = self.mapToScene(event.position().toPoint())
         theme_colors = self.parent_window.current_theme_colors
 
         if self.item_being_resized and self.current_resize_handle_type and (event.buttons() & Qt.MouseButton.LeftButton):
-            # current_pos_scene is already available
-            
-            # Ensure item_being_resized is still valid (e.g., not deleted)
-            if not self.item_being_resized or not self.item_being_resized.scene(): 
-                self.item_being_resized = None # Invalidate if item disappeared
+            if not self.item_being_resized or not self.item_being_resized.scene():
+                self.item_being_resized = None
                 self.current_resize_handle_type = None
                 return
 
-            dx = current_pos_scene.x() - self.resize_start_pos_scene.x()
-            dy = current_pos_scene.y() - self.resize_start_pos_scene.y()
+            # Calculate delta in scene coordinates, then transform to parent item's coordinates for rect manipulation
+            # For crop_overlay_rect, its parent is current_crop_item. We need delta in parent's (image item) coords.
+            # For regular item resize, parent is null (items are top-level), delta is in scene coords.
+
+            # Scene delta is fine for now as handles are positioned relative to item_being_resized's rect directly.
+            # The self.original_item_rect_on_resize_start is in item_being_resized's own coordinate system.
+            # dx/dy needs to be in the coordinate system of self.original_item_rect_on_resize_start
+
+            # If resizing crop_overlay_rect, its coordinates are relative to current_crop_item (the image)
+            # The self.resize_start_pos_scene and current_pos_scene are in scene coords.
+            # We need the delta in the coordinate system of crop_overlay_rect (which is child of current_crop_item)
+            
+            # Get the transform from scene to the parent of the item_being_resized (if it has one)
+            # or to the item itself if it's a top-level item for its own handles.
+            target_item_for_coords = self.item_being_resized
+            if self.item_being_resized == self.parent_window.crop_overlay_rect:
+                # crop_overlay_rect is a child of current_crop_item. Its rect is in current_crop_item's coords.
+                # Handles are children of crop_overlay_rect. Their movements affect crop_overlay_rect's rect.
+                # We need dx, dy in crop_overlay_rect's parent (current_crop_item) coordinate system.
+                parent_of_resized = self.item_being_resized.parentItem()
+                if parent_of_resized: # Should be current_crop_item
+                    map_to_parent_transform = parent_of_resized.sceneTransform().inverted()[0]
+                    start_pos_parent = map_to_parent_transform.map(self.resize_start_pos_scene)
+                    current_pos_parent = map_to_parent_transform.map(current_pos_scene)
+                    dx = current_pos_parent.x() - start_pos_parent.x()
+                    dy = current_pos_parent.y() - start_pos_parent.y()
+                else: # Should not happen for crop_overlay_rect
+                    dx = current_pos_scene.x() - self.resize_start_pos_scene.x()
+                    dy = current_pos_scene.y() - self.resize_start_pos_scene.y()
+            else:
+                 # For direct item resize, dx/dy in scene coords is fine as item.rect() is also scene-relative for top-level items with no parent for rect manipulation.
+                 # No, item.rect() is item-local. So dx, dy must be in item-local coords.
+                map_to_item_transform = self.item_being_resized.sceneTransform().inverted()[0]
+                start_pos_item = map_to_item_transform.map(self.resize_start_pos_scene)
+                current_pos_item = map_to_item_transform.map(current_pos_scene)
+                dx = current_pos_item.x() - start_pos_item.x()
+                dy = current_pos_item.y() - start_pos_item.y()
 
             new_rect = QRectF(self.original_item_rect_on_resize_start)
 
-            if self.current_resize_handle_type == "se":
-                new_rect.setBottomRight(QPointF(new_rect.bottomRight().x() + dx, new_rect.bottomRight().y() + dy))
-            
-            # Add other handle types here later (nw, ne, sw, n, s, e, w)
+            # Apply resize logic based on handle type
+            if self.current_resize_handle_type == "se": # Standard item SE resize
+                if isinstance(self.item_being_resized, QGraphicsPixmapItem):
+                    # --- QGraphicsPixmapItem SE Resize (Scaling) ---
+                    new_br_width = self.original_item_rect_on_resize_start.width() + dx
+                    new_br_height = self.original_item_rect_on_resize_start.height() + dy
 
-            # Enforce minimum size
-            if new_rect.width() < MIN_SHAPE_SIZE:
-                new_rect.setWidth(MIN_SHAPE_SIZE)
-            if new_rect.height() < MIN_SHAPE_SIZE:
-                new_rect.setHeight(MIN_SHAPE_SIZE)
+                    if self.item_being_resized.pixmap().width() == 0 or self.item_being_resized.pixmap().height() == 0: return
+                    
+                    if new_br_width < MIN_SHAPE_SIZE: new_br_width = MIN_SHAPE_SIZE
+                    if new_br_height < MIN_SHAPE_SIZE: new_br_height = MIN_SHAPE_SIZE
+                    
+                    new_scale_x = new_br_width / self.item_being_resized.pixmap().width()
+                    # For proportional SE resize on images:
+                    if self.parent_window.keep_image_aspect_ratio_on_resize:
+                        self.item_being_resized.setScale(new_scale_x) 
+                    else: 
+                        # Non-proportional: Need to use QTransform for non-uniform scaling
+                        # This is more complex. For now, SE on image is proportional.
+                        # If non-proportional is needed, we would calculate new_scale_y independently:
+                        # new_scale_y = new_br_height / self.item_being_resized.pixmap().height()
+                        # And then use: 
+                        # transform = QTransform().scale(new_scale_x, new_scale_y)
+                        # self.item_being_resized.setTransform(transform)
+                        # This requires current_resize_handle_type to be more granular or adjust origin point.
+                        # Sticking to setScale for simplicity, which is uniform.
+                        self.item_being_resized.setScale(new_scale_x) # Effectively proportional due to setScale
+
+                else: # For QGraphicsRectItem, QGraphicsEllipseItem (Shapes)
+                    new_rect.setBottomRight(QPointF(new_rect.bottomRight().x() + dx, new_rect.bottomRight().y() + dy))
+                    # Enforce minimum size for shapes before setting rect
+                    if new_rect.width() < MIN_SHAPE_SIZE: new_rect.setWidth(MIN_SHAPE_SIZE)
+                    if new_rect.height() < MIN_SHAPE_SIZE: new_rect.setHeight(MIN_SHAPE_SIZE)
+                    self.item_being_resized.setRect(new_rect.normalized())
             
-            self.item_being_resized.setRect(new_rect.normalized())
-            self.parent_window._update_resize_handles_for_item(self.item_being_resized) # Update handle positions
+            # --- Crop Handle Resizing Logic (item_being_resized is crop_overlay_rect) ---
+            elif self.current_resize_handle_type == "nw_crop":
+                new_rect.setTopLeft(QPointF(new_rect.topLeft().x() + dx, new_rect.topLeft().y() + dy))
+                self.constrain_and_set_crop_rect(new_rect)
+            elif self.current_resize_handle_type == "n_crop":
+                new_rect.setTop(new_rect.top() + dy)
+                self.constrain_and_set_crop_rect(new_rect)
+            elif self.current_resize_handle_type == "ne_crop":
+                new_rect.setTopRight(QPointF(new_rect.topRight().x() + dx, new_rect.topRight().y() + dy))
+                self.constrain_and_set_crop_rect(new_rect)
+            elif self.current_resize_handle_type == "w_crop":
+                new_rect.setLeft(new_rect.left() + dx)
+                self.constrain_and_set_crop_rect(new_rect)
+            elif self.current_resize_handle_type == "e_crop":
+                new_rect.setRight(new_rect.right() + dx)
+                self.constrain_and_set_crop_rect(new_rect)
+            elif self.current_resize_handle_type == "sw_crop":
+                new_rect.setBottomLeft(QPointF(new_rect.bottomLeft().x() + dx, new_rect.bottomLeft().y() + dy))
+                self.constrain_and_set_crop_rect(new_rect)
+            elif self.current_resize_handle_type == "s_crop":
+                new_rect.setBottom(new_rect.bottom() + dy)
+                self.constrain_and_set_crop_rect(new_rect)
+            elif self.current_resize_handle_type == "se_crop":
+                new_rect.setBottomRight(QPointF(new_rect.bottomRight().x() + dx, new_rect.bottomRight().y() + dy))
+                self.constrain_and_set_crop_rect(new_rect)
+            
+            # Update handles based on what was resized
+            if self.item_being_resized == self.parent_window.crop_overlay_rect:
+                self.parent_window._update_crop_handles()
+            else: # Regular item resize
+                self.parent_window._update_resize_handles_for_item(self.item_being_resized)
             event.accept()
-            return # Handled resize move
+            return
         
         # --- Drawing tools preview logic ---
         elif self.start_pos_scene and (event.buttons() & Qt.MouseButton.LeftButton) and tool in ["rectangle", "ellipse", "line"]:
@@ -251,20 +358,63 @@ class CustomGraphicsView(QGraphicsView):
         # Fallback to super for other moves (like item movement by select tool, hand tool panning)
         super().mouseMoveEvent(event)
 
+    def constrain_and_set_crop_rect(self, new_rect_proposed):
+        # Helper function for crop rectangle updates
+        if not (self.item_being_resized == self.parent_window.crop_overlay_rect and self.parent_window.current_crop_item):
+            return
+
+        image_bounds = self.parent_window.current_crop_item.boundingRect()
+        constrained_rect = QRectF(new_rect_proposed) # Work on a copy
+
+        # Constrain top-left
+        if constrained_rect.left() < image_bounds.left(): constrained_rect.setLeft(image_bounds.left())
+        if constrained_rect.top() < image_bounds.top(): constrained_rect.setTop(image_bounds.top())
+        # Constrain bottom-right
+        if constrained_rect.right() > image_bounds.right(): constrained_rect.setRight(image_bounds.right())
+        if constrained_rect.bottom() > image_bounds.bottom(): constrained_rect.setBottom(image_bounds.bottom())
+
+        # Enforce minimum size after constraining
+        if constrained_rect.width() < MIN_SHAPE_SIZE:
+            # Try to adjust from the side that wasn't explicitly against the boundary, if possible
+            if constrained_rect.left() == image_bounds.left() and constrained_rect.right() != image_bounds.right():
+                 constrained_rect.setRight(constrained_rect.left() + MIN_SHAPE_SIZE)
+            else: # Default to expanding/setting width from left or right if it was against boundary
+                 constrained_rect.setWidth(MIN_SHAPE_SIZE)
+        if constrained_rect.height() < MIN_SHAPE_SIZE:
+            if constrained_rect.top() == image_bounds.top() and constrained_rect.bottom() != image_bounds.bottom():
+                constrained_rect.setBottom(constrained_rect.top() + MIN_SHAPE_SIZE)
+            else:
+                constrained_rect.setHeight(MIN_SHAPE_SIZE)
+        
+        # Final check: ensure it's still within bounds after min size adjustment if min_size pushed it out
+        if constrained_rect.right() > image_bounds.right(): constrained_rect.setRight(image_bounds.right())
+        if constrained_rect.bottom() > image_bounds.bottom(): constrained_rect.setBottom(image_bounds.bottom())
+        if constrained_rect.left() < image_bounds.left(): constrained_rect.setLeft(image_bounds.left())
+        if constrained_rect.top() < image_bounds.top(): constrained_rect.setTop(image_bounds.top())
+
+        self.item_being_resized.setRect(constrained_rect.normalized())
+
     def mouseReleaseEvent(self, event):
         tool = self.parent_window.current_tool
-        theme_colors = self.parent_window.current_theme_colors
+        current_pos_scene = self.mapToScene(event.position().toPoint()) # Defined for general use
 
         if self.item_being_resized and event.button() == Qt.MouseButton.LeftButton:
+            # This handles release for both item resize and crop_overlay_rect resize
+            print(f"Resizing finished for: {self.item_being_resized}, handle: {self.current_resize_handle_type}")
+            if self.item_being_resized == self.parent_window.crop_overlay_rect:
+                # Final update to crop handles based on new crop_overlay_rect
+                self.parent_window._update_crop_handles()
+            else:
+                # Final update for regular item resize handles
+                 if self.parent_window.selected_item:
+                     self.parent_window._update_resize_handles_for_item(self.parent_window.selected_item)
+            
             self.item_being_resized = None
             self.current_resize_handle_type = None
             self.resize_start_pos_scene = None
             self.original_item_rect_on_resize_start = None
             event.accept()
-            # Update handles one last time, just in case
-            if self.parent_window.selected_item:
-                 self.parent_window._update_resize_handles_for_item(self.parent_window.selected_item)
-            return # Handled resize release
+            return
 
         # --- Drawing tools finalization logic ---
         if event.button() == Qt.MouseButton.LeftButton and self.start_pos_scene and tool in ["rectangle", "ellipse", "line"]:
@@ -274,13 +424,13 @@ class CustomGraphicsView(QGraphicsView):
                 self.current_preview_item_view = None
 
             final_item = None
-            outline_color = theme_colors["item_default_outline"]
+            outline_color = self.parent_window.current_theme_colors["item_default_outline"]
             pen = QPen(outline_color)
 
             if tool == "rectangle" or tool == "ellipse":
                 final_rect = QRectF(self.start_pos_scene, current_pos_scene).normalized()
                 if final_rect.width() >= MIN_SHAPE_SIZE and final_rect.height() >= MIN_SHAPE_SIZE:
-                    fill_color = theme_colors["item_default_fill"]
+                    fill_color = self.parent_window.current_theme_colors["item_default_fill"]
                     if tool == "rectangle":
                         final_item = QGraphicsRectItem(final_rect)
                     elif tool == "ellipse":
@@ -465,6 +615,7 @@ class CanvasWindow(QMainWindow):
         self.current_crop_item = None      # Item being cropped
         self.crop_overlay_rect = None    # Visual crop rectangle QGraphicsRectItem
         self.active_crop_handles = []    # Handles for the crop_overlay_rect
+        self.keep_image_aspect_ratio_on_resize = True # New flag
 
         self.themes = {"light": LIGHT_THEME, "dark": DARK_THEME}
         self.current_theme_name = "dark" # Default theme set to dark
@@ -1136,23 +1287,44 @@ class CanvasWindow(QMainWindow):
             self.scene.update()
 
     def enter_crop_mode(self):
-        if not self.selected_item or not isinstance(self.selected_item, QGraphicsPixmapItem) or not hasattr(self.selected_item, 'pil_original_image'):
+        print("enter_crop_mode called.")
+        if not self.selected_item:
+            print("enter_crop_mode: No item selected.")
+            QMessageBox.warning(self, "Cannot Crop", "No item selected. Please select an image loaded by the application to crop.")
+            return
+        
+        print(f"enter_crop_mode: Selected item is {type(self.selected_item)}, has pil_original_image: {hasattr(self.selected_item, 'pil_original_image')}")
+
+        if not isinstance(self.selected_item, QGraphicsPixmapItem) or not hasattr(self.selected_item, 'pil_original_image'):
+            print("enter_crop_mode: Selected item is not a valid image for cropping.")
             QMessageBox.warning(self, "Cannot Crop", "Please select an image loaded by the application to crop.")
             return
 
+        print("enter_crop_mode: Proceeding with crop mode setup.")
+
         if self.current_crop_item: # Already cropping another item? Or re-clicked on same item?
+            print(f"enter_crop_mode: Already in crop mode for {self.current_crop_item}. Current selection: {self.selected_item}")
             if self.current_crop_item == self.selected_item:
                 # Clicked "Crop Image" again for the item already in crop mode - do nothing or treat as cancel?
                 # For now, let's assume this state shouldn't be easily reachable if UI updates correctly.
                 return 
             else:
                 # Switched selection while an old crop was active - cancel old one first
+                print("enter_crop_mode: Switching crop target, cancelling old crop.")
                 self.exit_crop_mode(apply_changes=False) 
 
-        self.current_crop_item = self.selected_item
+        item_to_crop = self.selected_item # Store it before it gets deselected
+        if not item_to_crop: # Should have been caught earlier, but as a safeguard
+            print("enter_crop_mode: Error - item_to_crop became None unexpectedly.")
+            return
+
+        self.current_crop_item = item_to_crop
         self._remove_resize_handles() # Remove item resize handles, as we'll use crop handles
-        self.selected_item.setSelected(False) # Deselect to avoid confusion with item move/resize
-        self.selected_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, False) # Disable moving base image
+        
+        # Deselect the item. This will trigger on_scene_selection_changed, which sets self.selected_item to None.
+        # That's fine, as we are now using item_to_crop and self.current_crop_item.
+        item_to_crop.setSelected(False) 
+        item_to_crop.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, False) # Disable moving base image
 
         # Create visual crop rectangle as a child of the image item
         # It uses the image's local coordinates.
@@ -1171,39 +1343,62 @@ class CanvasWindow(QMainWindow):
         print(f"Entering crop mode for {self.current_crop_item}")
 
     def _create_crop_handles(self):
-        # Similar to _create_resize_handles_for_item but for self.crop_overlay_rect
-        # and handles should be parented to self.crop_overlay_rect or self.current_crop_item
         self._remove_crop_handles() # Clear any existing crop handles
         if not self.crop_overlay_rect or not self.current_crop_item:
             return
 
-        parent_for_handles = self.crop_overlay_rect # Handles are children of the crop rect
-        rect_to_handle = self.crop_overlay_rect.rect() # This is in crop_overlay_rect's local coords (0,0 top-left)
+        parent_for_handles = self.crop_overlay_rect
+        rect_to_handle = self.crop_overlay_rect.rect() # In crop_overlay_rect's local coords (0,0 top-left)
 
-        # SE handle (bottom-right of the crop_overlay_rect)
-        se_pos = QPointF(rect_to_handle.right() - HANDLE_SIZE / 2, rect_to_handle.bottom() - HANDLE_SIZE / 2)
-        se_handle = QGraphicsRectItem(0, 0, HANDLE_SIZE, HANDLE_SIZE, parent_for_handles)
-        se_handle.setPos(se_pos)
-        se_handle.setBrush(self.current_theme_colors["selected_handle_fill"]) # Use theme colors
-        se_handle.setPen(QPen(self.current_theme_colors["selected_handle_outline"], 1))
-        se_handle.is_crop_handle = True 
-        se_handle.handle_type = "se_crop"
-        se_handle.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable, False) # Prevent movement via item dragging
-        self.active_crop_handles.append(se_handle)
-        # Add other handles (nw, ne, sw, n, s, e, w) here later for full cropping
+        handle_positions = {
+            "nw_crop": QPointF(rect_to_handle.left() - HANDLE_SIZE / 2, rect_to_handle.top() - HANDLE_SIZE / 2),
+            "n_crop":  QPointF(rect_to_handle.center().x() - HANDLE_SIZE / 2, rect_to_handle.top() - HANDLE_SIZE / 2),
+            "ne_crop": QPointF(rect_to_handle.right() - HANDLE_SIZE / 2, rect_to_handle.top() - HANDLE_SIZE / 2),
+            "w_crop":  QPointF(rect_to_handle.left() - HANDLE_SIZE / 2, rect_to_handle.center().y() - HANDLE_SIZE / 2),
+            "e_crop":  QPointF(rect_to_handle.right() - HANDLE_SIZE / 2, rect_to_handle.center().y() - HANDLE_SIZE / 2),
+            "sw_crop": QPointF(rect_to_handle.left() - HANDLE_SIZE / 2, rect_to_handle.bottom() - HANDLE_SIZE / 2),
+            "s_crop":  QPointF(rect_to_handle.center().x() - HANDLE_SIZE / 2, rect_to_handle.bottom() - HANDLE_SIZE / 2),
+            "se_crop": QPointF(rect_to_handle.right() - HANDLE_SIZE / 2, rect_to_handle.bottom() - HANDLE_SIZE / 2),
+        }
+
+        for handle_type, pos in handle_positions.items():
+            handle = QGraphicsRectItem(0, 0, HANDLE_SIZE, HANDLE_SIZE, parent_for_handles)
+            handle.setPos(pos)
+            handle.setBrush(self.current_theme_colors["selected_handle_fill"])
+            handle.setPen(QPen(self.current_theme_colors["selected_handle_outline"], 1))
+            handle.is_crop_handle = True
+            handle.handle_type = handle_type
+            handle.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable, False)
+            self.active_crop_handles.append(handle)
 
     def _update_crop_handles(self):
         if not self.active_crop_handles or not self.crop_overlay_rect: return
         rect_to_handle = self.crop_overlay_rect.rect()
+
+        # Define desired positions based on the current rect_to_handle
+        new_handle_positions = {
+            "nw_crop": QPointF(rect_to_handle.left() - HANDLE_SIZE / 2, rect_to_handle.top() - HANDLE_SIZE / 2),
+            "n_crop":  QPointF(rect_to_handle.center().x() - HANDLE_SIZE / 2, rect_to_handle.top() - HANDLE_SIZE / 2),
+            "ne_crop": QPointF(rect_to_handle.right() - HANDLE_SIZE / 2, rect_to_handle.top() - HANDLE_SIZE / 2),
+            "w_crop":  QPointF(rect_to_handle.left() - HANDLE_SIZE / 2, rect_to_handle.center().y() - HANDLE_SIZE / 2),
+            "e_crop":  QPointF(rect_to_handle.right() - HANDLE_SIZE / 2, rect_to_handle.center().y() - HANDLE_SIZE / 2),
+            "sw_crop": QPointF(rect_to_handle.left() - HANDLE_SIZE / 2, rect_to_handle.bottom() - HANDLE_SIZE / 2),
+            "s_crop":  QPointF(rect_to_handle.center().x() - HANDLE_SIZE / 2, rect_to_handle.bottom() - HANDLE_SIZE / 2),
+            "se_crop": QPointF(rect_to_handle.right() - HANDLE_SIZE / 2, rect_to_handle.bottom() - HANDLE_SIZE / 2),
+        }
+
         for handle in self.active_crop_handles:
-            if handle.handle_type == "se_crop":
-                handle.setPos(rect_to_handle.right() - HANDLE_SIZE / 2, rect_to_handle.bottom() - HANDLE_SIZE / 2)
+            if handle.handle_type in new_handle_positions:
+                handle.setPos(new_handle_positions[handle.handle_type])
+                # Also update handle colors in case theme changed while active
                 handle.setBrush(self.current_theme_colors["selected_handle_fill"])
                 handle.setPen(QPen(self.current_theme_colors["selected_handle_outline"], 1))
 
     def _remove_crop_handles(self):
-        for handle in self.active_crop_handles:
-            if handle.scene(): self.scene.removeItem(handle)
+        # Iterate over a copy if modifying the list, or just clear after scene removal
+        for handle in list(self.active_crop_handles): # Iterate a copy
+            if handle and handle.scene(): # Check if handle is not None and still in a scene
+                self.scene.removeItem(handle)
         self.active_crop_handles.clear()
 
     def exit_crop_mode(self, apply_changes=False):
@@ -1212,10 +1407,12 @@ class CanvasWindow(QMainWindow):
         
         item_was_cropped = self.current_crop_item
 
-        if apply_changes and self.crop_overlay_rect:
+        # Store crop_overlay_rect locally because self.crop_overlay_rect will be set to None
+        local_crop_overlay_rect = self.crop_overlay_rect
+
+        if apply_changes and local_crop_overlay_rect:
             # 1. Get crop rectangle in item's local coordinates.
-            # crop_overlay_rect is already a child, its rect() is what we need.
-            crop_box_item_coords = self.crop_overlay_rect.rect()
+            crop_box_item_coords = local_crop_overlay_rect.rect()
 
             # 2. Ensure crop_box is valid (e.g., positive width/height)
             if crop_box_item_coords.width() < 1 or crop_box_item_coords.height() < 1:
@@ -1265,18 +1462,27 @@ class CanvasWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Crop Error", f"Could not apply crop: {e}")
                 print(f"Error during PIL crop: {e}")
-                # Fall through to cleanup, effectively canceling the visual crop mode changes.
         
         # Cleanup UI
-        if self.crop_overlay_rect:
-            self.scene.removeItem(self.crop_overlay_rect) # It's a child, but remove from scene explicitly
-            self.crop_overlay_rect = None # This should also remove its children (handles)
-        self._remove_crop_handles()
+        self._remove_crop_handles() # Call this first to remove handles from scene before their parent overlay is gone
+                                  # This assumes handles are NOT children of crop_overlay_rect for this to work, 
+                                  # or that _remove_crop_handles is safe against already deleted items.
+                                  # Current _create_crop_handles makes them children. So this is problematic.
+
+        # Revised cleanup:
+        # 1. Remove handles explicitly IF they are not children or if we want to be sure before parent removal.
+        #    However, _create_crop_handles makes them children of crop_overlay_rect.
+        #    So, removing crop_overlay_rect should remove the handles. Our list just needs clearing.
+
+        if self.crop_overlay_rect: # Check if it exists
+            self.scene.removeItem(self.crop_overlay_rect)
+            self.crop_overlay_rect = None # This should trigger Qt to delete children (handles)
+        
+        self.active_crop_handles.clear() # Clear our Python list of handles
         
         item_was_cropped.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, True) # Re-enable moving
-        # Re-select the item to restore normal selection behavior and show resize handles
+        item_was_cropped.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable, True) # Ensure it's selectable
         item_was_cropped.setSelected(True) 
-        # on_scene_selection_changed will be triggered, which should call _create_resize_handles_for_item
 
         self.current_crop_item = None
         self._update_properties_panel_for_selection() # Update buttons
