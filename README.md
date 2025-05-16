@@ -27,6 +27,11 @@ A Figma-like canvas application built with Python and the Qt framework (PySide6)
 *   Eraser tool (pixel-based, rasterizes vector shapes on touch)
 *   Properties panel for selected items (color, width, image effects)
 *   Basic menu and toolbar structure.
+*   Undo/Redo for item additions and other operations (ongoing for properties).
+*   Table Pasting: Paste tabular data (TSV/CSV) from clipboard as a graphical table.
+*   Text Tool: Add and edit text items, change font family, size, and color.
+*   Clipboard Image Pasting: Paste images directly from the clipboard onto the canvas.
+*   Selective Interactivity: Images are not draggable or resizable by mouse/handles, while other elements (shapes, text, tables) remain fully interactive.
 
 ## Prerequisites
 
