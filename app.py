@@ -1,9 +1,11 @@
 import sys
-from io import BytesIO
+import csv # Added for table parsing
+from io import BytesIO, StringIO # Added StringIO for csv module
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QToolBar, QDockWidget, QWidget, QVBoxLayout, QLabel, QPushButton, QRadioButton,
     QGraphicsRectItem, QGraphicsEllipseItem, QToolButton, QMenu, QColorDialog, QGraphicsLineItem, QFileDialog, QGraphicsPixmapItem, QMessageBox,
-    QMenuBar, QSlider, QSpinBox, QGraphicsPathItem, QGraphicsPolygonItem, QHBoxLayout, QStyleOptionGraphicsItem # Added QStyleOptionGraphicsItem
+    QMenuBar, QSlider, QSpinBox, QGraphicsPathItem, QGraphicsPolygonItem, QHBoxLayout, QStyleOptionGraphicsItem,
+    QGraphicsItemGroup, QGraphicsSimpleTextItem # Added QGraphicsItemGroup and QGraphicsSimpleTextItem
 )
 from PySide6.QtGui import QAction, QIcon, QColor, QPainter, QPen, QBrush, QImage, QPixmap, QPainterPath, QPolygonF, QTransform # Added QTransform
 from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, QBuffer
@@ -123,6 +125,10 @@ class CustomGraphicsView(QGraphicsView):
 
     def mousePressEvent(self, event):
         tool = self.parent_window.current_tool
+
+        if tool == "hand":
+            super().mousePressEvent(event) # Pass directly to base for hand tool
+            return
         
         if event.button() == Qt.MouseButton.LeftButton:
             self.start_pos_scene = self.mapToScene(event.position().toPoint())
@@ -209,6 +215,11 @@ class CustomGraphicsView(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         tool = self.parent_window.current_tool
+
+        if tool == "hand":
+            super().mouseMoveEvent(event) # Pass directly to base for hand tool
+            return
+
         current_pos_scene = self.mapToScene(event.position().toPoint())
         theme_colors = self.parent_window.current_theme_colors
 
@@ -526,6 +537,24 @@ class CustomGraphicsView(QGraphicsView):
         new_pos = self.mapToScene(event.position().toPoint())
         delta = new_pos - old_pos
         self.translate(delta.x(), delta.y())
+
+    def contextMenuEvent(self, event):
+        # Create a context menu
+        menu = QMenu(self)
+        scene_pos = self.mapToScene(event.pos())
+
+        # Check if there is text on the clipboard
+        clipboard = QApplication.clipboard()
+        has_text_on_clipboard = clipboard.mimeData().hasText()
+
+        paste_table_action = QAction("Paste Table", self)
+        paste_table_action.setEnabled(has_text_on_clipboard)
+        paste_table_action.triggered.connect(lambda: self.parent_window.paste_table_from_clipboard(scene_pos))
+        menu.addAction(paste_table_action)
+
+        # Show the context menu at the event position
+        menu.exec(event.globalPos())
+        # super().contextMenuEvent(event) # Optional: call if you want base class behavior too
 
     def _erase_at_point(self, scene_pos):
         brush_size = self.parent_window.eraser_brush_size
@@ -1033,17 +1062,17 @@ class CanvasWindow(QMainWindow):
             self.update_shape_tool_button_text() # Keep showing last selected/default shape
 
             if self.current_tool == "select":
-                self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
-                self.view.setInteractive(True)
+                self.view.setInteractive(True) # Must be interactive for item selection/movement
+                self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag) # Or NoDrag if items handle their own move
                 self.view.setCursor(Qt.CursorShape.ArrowCursor)
             elif self.current_tool == "hand":
+                self.view.setInteractive(False) # Crucial: View handles panning, not items
                 self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-                self.view.setInteractive(False) # View handles panning, item interaction off
                 self.view.setCursor(Qt.CursorShape.OpenHandCursor)
+                self.view.setFocus(Qt.FocusReason.OtherFocusReason) # Explicitly set focus
             elif self.current_tool == "eraser":
-                self.view.setDragMode(QGraphicsView.DragMode.NoDrag) # We will handle erase path manually
-                self.view.setInteractive(False) # Items should not be selectable/movable by eraser tool itself
-                self.view.setCursor(Qt.CursorShape.CrossCursor) # Placeholder, can be custom later
+                self.view.setInteractive(False)
+                self.view.setDragMode(QGraphicsView.DragMode.NoDrag) 
         
         # Clear selection if switching away from select tool with an item selected (optional)
         if tool_name != "select" and self.selected_item:
@@ -2021,6 +2050,97 @@ class CanvasWindow(QMainWindow):
             self.image_height_spinbox.setValue(self.image_height_spinbox.minimum() if self.image_height_spinbox.minimum() > 0 else 1)
             self.image_width_spinbox.blockSignals(False)
             self.image_height_spinbox.blockSignals(False)
+
+    # --- Table Pasting Method ---
+    def paste_table_from_clipboard(self, scene_pos):
+        clipboard = QApplication.clipboard()
+        mime_data = clipboard.mimeData()
+
+        if not mime_data.hasText():
+            QMessageBox.information(self, "Paste Error", "No text data found on clipboard.")
+            return
+
+        clipboard_text = mime_data.text()
+        if not clipboard_text.strip():
+            QMessageBox.information(self, "Paste Error", "Clipboard text is empty.")
+            return
+
+        # Try to parse as TSV (Tab Separated Values) then CSV
+        parsed_rows = []
+        try:
+            # Use StringIO to treat the string as a file for csv.reader
+            f = StringIO(clipboard_text)
+            # Attempt to sniff the dialect
+            dialect = None
+            try:
+                dialect = csv.Sniffer().sniff(clipboard_text.splitlines()[0]) # Sniff first line
+            except csv.Error:
+                # Sniffing failed, try common delimiters
+                if '\t' in clipboard_text.splitlines()[0]:
+                    dialect = csv.excel_tab
+                else:
+                    dialect = csv.excel # Default to Excel (comma-separated)
+            
+            reader = csv.reader(f, dialect)
+            for row in reader:
+                parsed_rows.append(row)
+        except Exception as e:
+            QMessageBox.warning(self, "Parse Error", f"Could not parse table data: {e}")
+            return
+
+        if not parsed_rows:
+            QMessageBox.information(self, "Paste Error", "No rows found in pasted table data.")
+            return
+
+        # --- Create Table Graphics ---
+        table_group = QGraphicsItemGroup()
+        table_group.setFlag(QGraphicsItemGroup.GraphicsItemFlag.ItemIsSelectable, True)
+        table_group.setFlag(QGraphicsItemGroup.GraphicsItemFlag.ItemIsMovable, True)
+        # table_group.setFlag(QGraphicsItemGroup.GraphicsItemFlag.ItemSendsGeometryChanges, True) # For future resizing
+
+        # Default cell styling and dimensions
+        cell_padding = 5.0
+        default_cell_width = 100.0 
+        default_cell_height = 30.0
+        theme_colors = self.current_theme_colors
+        cell_border_pen = QPen(theme_colors["item_default_outline"])
+        cell_fill_brush = QBrush(theme_colors["window_bg"]) # Use window_bg for cells, or a lighter properties_bg
+        text_color = theme_colors["text_color"]
+
+        current_y = 0.0
+        max_cols = max(len(row) for row in parsed_rows) if parsed_rows else 0
+
+        for row_idx, row_data in enumerate(parsed_rows):
+            current_x = 0.0
+            row_actual_height = default_cell_height # Could calculate based on text in future
+            for col_idx in range(max_cols):
+                cell_text_content = row_data[col_idx] if col_idx < len(row_data) else ""
+                cell_actual_width = default_cell_width # Could calculate based on text
+
+                # Create cell rectangle (background and border)
+                cell_rect_item = QGraphicsRectItem(0, 0, cell_actual_width, row_actual_height, table_group)
+                cell_rect_item.setPos(current_x, current_y)
+                cell_rect_item.setPen(cell_border_pen)
+                cell_rect_item.setBrush(cell_fill_brush)
+
+                # Create cell text
+                text_item = QGraphicsSimpleTextItem(cell_text_content, table_group)
+                text_item.setPos(current_x + cell_padding, current_y + cell_padding)
+                text_item.setBrush(QBrush(text_color)) 
+                # text_item.setFont(...) # Can set font here
+                
+                # Ensure text does not overflow cell_actual_width - 2*cell_padding (approx)
+                # QGraphicsSimpleTextItem does not auto-wrap or clip aggressively. 
+                # For proper handling, QGraphicsTextItem would be needed, or manual truncation.
+                # This is a simple start.
+
+                current_x += cell_actual_width
+            current_y += row_actual_height
+        
+        table_group.setPos(scene_pos)
+        self.scene.addItem(table_group)
+        table_group.setSelected(True) # Select the new table
+        print("Table pasted successfully.")
 
 
 if __name__ == "__main__":
