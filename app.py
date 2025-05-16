@@ -84,8 +84,13 @@ DARK_THEME = {
 def qimage_to_pil(qimage):
     buffer = QBuffer()
     buffer.open(QBuffer.OpenModeFlag.ReadWrite)
-    # Always use PNG to ensure lossless conversion from QImage to PIL, especially for pil_original_image
-    qimage.save(buffer, "PNG") 
+    # Determine format based on qimage properties, default to PNG for broad compatibility with alpha
+    # qimage.save(buffer, "PNG") # Specify format
+    # Let Qt choose the best format, or be more specific. PNG is good for alpha.
+    if qimage.hasAlphaChannel():
+        qimage.save(buffer, "PNG")
+    else:
+        qimage.save(buffer, "JPG") # Or PNG if preferred even without alpha
     
     pil_im = Image.open(BytesIO(buffer.data()))
     return pil_im
@@ -196,8 +201,9 @@ class CustomGraphicsView(QGraphicsView):
                                 self.original_item_rect_on_resize_start = self.item_being_resized.boundingRect()
                             
                             self.original_item_scale_on_resize_start = self.item_being_resized.scale()
+
                         else:
-                            self.current_resize_handle_type = None 
+                            self.current_resize_handle_type = None
                             super().mousePressEvent(event) # Fallback
                             return
                         event.accept()
@@ -210,8 +216,8 @@ class CustomGraphicsView(QGraphicsView):
                     # If not on a handle, let the base class handle selection/movement
                     super().mousePressEvent(event)
                     return
-            elif tool == "hand": # This case should technically be caught by the first check, but good for clarity
-                super().mousePressEvent(event) 
+            elif tool == "hand":
+                super().mousePressEvent(event) # Allow hand tool to initiate drag
                 return
             elif tool == "eraser":
                 self.is_erasing_active = True
@@ -243,6 +249,7 @@ class CustomGraphicsView(QGraphicsView):
                 text_item.setPlainText("Type here...") # Default text
                 text_item.setPos(self.start_pos_scene)
                 text_item.setDefaultTextColor(self.parent_window.current_theme_colors["text_color"])
+                # text_item.setFont(...) # TODO: Add font selection later
                 
                 text_item.setFlag(QGraphicsTextItem.GraphicsItemFlag.ItemIsSelectable, True)
                 text_item.setFlag(QGraphicsTextItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -250,19 +257,21 @@ class CustomGraphicsView(QGraphicsView):
 
                 command = AddItemCommand(text_item, self.scene(), "Add Text")
                 self.parent_window.undo_stack.push(command)
+                # AddItemCommand.redo() will select it. It also focuses it for editing.
+                # text_item.setFocus(Qt.FocusReason.MouseFocusReason) # Ensure it gets focus to start typing
+                # The focus should be set after it's added and selected by the command's redo.
+                # We can connect to the command's redo completion if needed, or just let selection handle focus if Qt does.
+                # For now, relying on selection from AddItemCommand to potentially give focus.
+                # If direct editing isn't triggered, we might need to explicitly call setFocus later.
                 event.accept()
                 return
-            # For drawing tools (rectangle, ellipse, line, triangle), 
-            # start_pos_scene is set here. Actual item creation is in mouseRelease.
-            # No explicit event.accept() here as mouseMove will handle previews.
-            # If no specific drawing tool logic is needed on press beyond setting start_pos,
-            # this block could be further simplified. For now, it's an implicit pass-through.
+            # For drawing tools, start_pos_scene is already set, handled in move/release
 
-        # Fallback for other mouse buttons or if not handled above by specific tool logic for LeftButton.
-        # This ensures right-clicks, middle-clicks, or unhandled left-clicks can still be processed by the base class (e.g., for context menus if not overridden).
-        # However, most of our LeftButton presses are handled and `return`ed.
-        # If event was not accepted and returned by specific tool logic:
-        if not event.isAccepted():
+        # Fallback for other mouse buttons or if not handled above
+        # super().mousePressEvent(event)
+        # We need to be careful not to call super multiple times or when not needed
+        # If it's not a left click or not a tool we handle custom press for, let super handle it.
+        if not (event.button() == Qt.MouseButton.LeftButton and tool in ["rectangle", "ellipse", "line", "select", "hand"]):
             super().mousePressEvent(event)
 
 
@@ -273,11 +282,11 @@ class CustomGraphicsView(QGraphicsView):
             super().mouseMoveEvent(event) # Pass directly to base for hand tool
             return
 
-            current_pos_scene = self.mapToScene(event.position().toPoint())
+        current_pos_scene = self.mapToScene(event.position().toPoint())
         theme_colors = self.parent_window.current_theme_colors
-            
+
         if self.item_being_resized and self.current_resize_handle_type and (event.buttons() & Qt.MouseButton.LeftButton):
-            if not self.item_being_resized or not self.item_being_resized.scene(): 
+            if not self.item_being_resized or not self.item_being_resized.scene():
                 self.item_being_resized = None
                 self.current_resize_handle_type = None
                 return
@@ -309,12 +318,11 @@ class CustomGraphicsView(QGraphicsView):
                     dx = current_pos_parent.x() - start_pos_parent.x()
                     dy = current_pos_parent.y() - start_pos_parent.y()
                 else: # Should not happen for crop_overlay_rect
-                    # This case means crop_overlay_rect has no parent, fallback to scene coords for delta.
-                    # This is unlikely given how crop_overlay_rect is created as a child.
                     dx = current_pos_scene.x() - self.resize_start_pos_scene.x()
                     dy = current_pos_scene.y() - self.resize_start_pos_scene.y()
             else:
-                 # For direct item resize, dx/dy must be in item-local coords.
+                 # For direct item resize, dx/dy in scene coords is fine as item.rect() is also scene-relative for top-level items with no parent for rect manipulation.
+                 # No, item.rect() is item-local. So dx, dy must be in item-local coords.
                 map_to_item_transform = self.item_being_resized.sceneTransform().inverted()[0]
                 start_pos_item = map_to_item_transform.map(self.resize_start_pos_scene)
                 current_pos_item = map_to_item_transform.map(current_pos_scene)
@@ -335,7 +343,7 @@ class CustomGraphicsView(QGraphicsView):
                     if new_local_rect.height() < MIN_SHAPE_SIZE: new_local_rect.setHeight(MIN_SHAPE_SIZE)
                     self.item_being_resized.setRect(new_local_rect.normalized())
                 
-                elif isinstance(self.item_being_resized, (QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsLineItem, QGraphicsTextItem, QGraphicsItemGroup)):
+                elif isinstance(self.item_being_resized, (QGraphicsPixmapItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsLineItem)):
                     # Proportional scaling for these types using SE handle
                     # dx is local change in width if handle was at bottom-right of original_rect_local
                     desired_new_local_width = original_rect_local.width() + dx
@@ -344,16 +352,19 @@ class CustomGraphicsView(QGraphicsView):
                     current_item_initial_scale = self.original_item_scale_on_resize_start 
                     
                     base_width_for_scaling = 0
-                    # Reverted to original general logic for base_width_for_scaling
-                    # For Path, Polygon, Line, Text, Group: their "base width" is effectively their 
-                    # bounding rect width when their scale is 1.0.
-                    # original_rect_local.width() is the width at current_item_initial_scale.
-                    # So, base_width = original_rect_local.width() / current_item_initial_scale
-                    if current_item_initial_scale != 0:
-                        base_width_for_scaling = original_rect_local.width() / current_item_initial_scale
-                    else: # Item scale is 0 or initial scale was 0, use original_rect_local.width as base
-                          # (will result in 0 scale if width is 0, or keep MIN_SHAPE_SIZE if that was hit)
-                        base_width_for_scaling = original_rect_local.width()
+                    if isinstance(self.item_being_resized, QGraphicsPixmapItem):
+                        # For pixmaps, base width is its unscaled pixmap width.
+                        base_width_for_scaling = self.item_being_resized.pixmap().width() 
+                    else: 
+                        # For Path, Polygon, Line: their "base width" is effectively their 
+                        # bounding rect width when their scale is 1.0.
+                        # original_rect_local.width() is the width at current_item_initial_scale.
+                        # So, base_width = original_rect_local.width() / current_item_initial_scale
+                        if current_item_initial_scale != 0:
+                            base_width_for_scaling = original_rect_local.width() / current_item_initial_scale
+                        else: # Item scale is 0, use original_rect_local.width as base (will result in 0 scale if width is 0)
+                            base_width_for_scaling = original_rect_local.width()
+
 
                     if base_width_for_scaling > 0:
                         new_scale_value = desired_new_local_width / base_width_for_scaling
@@ -529,7 +540,6 @@ class CustomGraphicsView(QGraphicsView):
                     self.start_pos_scene = None # Reset to prevent accidental small shape
                     return
 
-                # Corrected indentation for shape creation logic
                 if tool == "rectangle":
                     final_item = QGraphicsRectItem(final_bounding_rect)
                 elif tool == "ellipse":
@@ -604,21 +614,12 @@ class CustomGraphicsView(QGraphicsView):
 
         # Check if there is text on the clipboard
         clipboard = QApplication.clipboard()
-        mime_data = clipboard.mimeData() # Store mimeData
-        has_text_on_clipboard = mime_data.hasText()
-        has_image_on_clipboard = mime_data.hasImage() # Check for image
+        has_text_on_clipboard = clipboard.mimeData().hasText()
 
         paste_table_action = QAction("Paste Table", self)
         paste_table_action.setEnabled(has_text_on_clipboard)
         paste_table_action.triggered.connect(lambda: self.parent_window.paste_table_from_clipboard(scene_pos))
         menu.addAction(paste_table_action)
-
-        # --- Add Paste Image Action ---
-        paste_image_action = QAction("Paste Image", self)
-        paste_image_action.setEnabled(has_image_on_clipboard)
-        paste_image_action.triggered.connect(lambda: self.parent_window.paste_image_from_clipboard(scene_pos))
-        menu.addAction(paste_image_action)
-        # --- End Paste Image Action ---
 
         # Show the context menu at the event position
         menu.exec(event.globalPos())
@@ -747,7 +748,6 @@ class CanvasWindow(QMainWindow):
         self.scene.setBackgroundBrush(QColor("white"))
         self.view = CustomGraphicsView(self.scene, self)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True) # Added for better image scaling
         self.setCentralWidget(self.view)
 
         self.current_tool = "select"
@@ -1102,7 +1102,7 @@ class CanvasWindow(QMainWindow):
         self.font_family_combo.setVisible(False)
         self.font_size_label.setVisible(False)
         self.font_size_spinbox.setVisible(False)
-        
+
         self.properties_layout.addStretch() # Pushes controls to the top
         self.properties_dock.setWidget(self.properties_widget)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.properties_dock)
@@ -1243,20 +1243,15 @@ class CanvasWindow(QMainWindow):
         self._remove_resize_handles() 
         theme_colors = self.current_theme_colors
 
-        # Prevent handles for QGraphicsPixmapItem
-        if isinstance(parent_item, QGraphicsPixmapItem):
-            return # No resize handles for images
-
         item_rect_for_handles = None
-        # QGraphicsItemGroup added here so tables can be resized.
-        # QGraphicsTextItem also needs handles for resizing.
-        if isinstance(parent_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsItemGroup, QGraphicsTextItem)):
+        if isinstance(parent_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem)):
             item_rect_for_handles = parent_item.boundingRect()
-            if item_rect_for_handles.isEmpty() and not (isinstance(parent_item, QGraphicsLineItem) and parent_item.line().length() == 0): 
+            # Basic check for validity, though boundingRect should generally be valid if item is visible
+            if item_rect_for_handles.isEmpty() and not (isinstance(parent_item, QGraphicsLineItem) and parent_item.line().length() == 0): # Allow zero-length line if just drawn
                  print(f"Cannot create handles for item {parent_item} with empty bounding rect.")
                  return 
         else:
-            return # No handles for other types not explicitly listed
+            return # No handles for other types
 
         # SE handle (bottom-right of the bounding rect in item's local coords)
         se_pos_x = item_rect_for_handles.right() - HANDLE_SIZE / 2
@@ -1272,11 +1267,26 @@ class CanvasWindow(QMainWindow):
 
     def _update_resize_handles_for_item(self, parent_item):
         if not self.active_resize_handles or not parent_item: 
+            # If no parent_item, but handles exist, they are orphaned, remove them.
+            if not parent_item and self.active_resize_handles:
+                self._remove_resize_handles()
             return
-
+        
+        item_rect_for_handles = None
+        if isinstance(parent_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem)):
+            item_rect_for_handles = parent_item.boundingRect()
+            if item_rect_for_handles.isEmpty() and not (isinstance(parent_item, QGraphicsLineItem) and parent_item.line().length() == 0):
+                self._remove_resize_handles() # Remove handles if item's rect becomes invalid
+                return
+        else:
+            self._remove_resize_handles() 
+            return
+        
         for handle in self.active_resize_handles:
             if handle.handle_type == "se":
-                handle.setPos(parent_item.mapFromScene(self.start_pos_scene))
+                se_pos_x = item_rect_for_handles.right() - HANDLE_SIZE / 2
+                se_pos_y = item_rect_for_handles.bottom() - HANDLE_SIZE / 2
+                handle.setPos(QPointF(se_pos_x, se_pos_y))
                 handle.setBrush(self.current_theme_colors["selected_handle_fill"])
                 handle.setPen(QPen(self.current_theme_colors["selected_handle_outline"]))
 
@@ -1384,13 +1394,12 @@ class CanvasWindow(QMainWindow):
                 self.cancel_crop_button.setVisible(self.current_crop_item == item)
                 self.save_image_button.setVisible(True) 
 
-                # <<< MODIFIED: Hide size controls for images as they are no longer resizable >>>
-                self.image_size_label.setVisible(False)
-                self.image_width_label.setVisible(False)
-                self.image_width_spinbox.setVisible(False)
-                self.image_height_label.setVisible(False)
-                self.image_height_spinbox.setVisible(False)
-                # self._update_image_size_spinboxes(item) # No longer needed if controls are hidden
+                self.image_size_label.setVisible(True)
+                self.image_width_label.setVisible(True)
+                self.image_width_spinbox.setVisible(True)
+                self.image_height_label.setVisible(True)
+                self.image_height_spinbox.setVisible(True)
+                self._update_image_size_spinboxes(item) # Call helper here
                 
                 if not self.current_crop_item or self.current_crop_item != item:
                     slider_val = int(item.current_brightness_factor * 100)
@@ -1468,7 +1477,7 @@ class CanvasWindow(QMainWindow):
                 self.font_family_combo.setVisible(False)
                 self.font_size_label.setVisible(False)
                 self.font_size_spinbox.setVisible(False)
-            
+
             self.prop_label.setText(f"Selected: {item_type_str}")
 
         else: # No item selected
@@ -1551,8 +1560,8 @@ class CanvasWindow(QMainWindow):
             pixmap = QPixmap(file_path)
             if not pixmap.isNull():
                 image_item = QGraphicsPixmapItem(pixmap)
-                image_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable, True)
-                image_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, False) # <<< MODIFIED: Images not movable
+                image_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable)
+                image_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable)
                 
                 # Store PIL image versions
                 q_img_original = pixmap.toImage() # Get QImage from initial pixmap
@@ -1563,7 +1572,7 @@ class CanvasWindow(QMainWindow):
                 image_item.current_brightness_factor = 1.0
                 # Ensure pixmap reflects pil_for_display if any conversion differences
                 # image_item.setPixmap(QPixmap.fromImage(pil_to_qimage(image_item.pil_for_display))) # Already set from file load
-                
+
                 # Position in the center of the current view
                 view_rect = self.view.viewport().rect()
                 scene_center_point = self.view.mapToScene(view_rect.center())
@@ -2361,44 +2370,6 @@ class CanvasWindow(QMainWindow):
             self.selected_item.setFont(current_item_font)
             # No need to call _update_properties_panel_for_selection here as spinbox already has the value
             # self.selected_item.update() #setFont should trigger update
-
-    # --- Clipboard Image Pasting Method (New) ---
-    def paste_image_from_clipboard(self, scene_pos):
-        clipboard = QApplication.clipboard()
-        q_image = clipboard.image() # Fetches QImage directly
-
-        if q_image.isNull():
-            QMessageBox.information(self, "Paste Error", "No image data found on clipboard or image format not supported.")
-            return
-
-        pixmap = QPixmap.fromImage(q_image)
-        if pixmap.isNull():
-            QMessageBox.warning(self, "Paste Error", "Could not convert clipboard image to a usable format.")
-            return
-
-        image_item = QGraphicsPixmapItem(pixmap)
-        image_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable, True)
-        image_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, False) # <<< MODIFIED: Images not movable
-
-        # Store PIL image versions and properties for consistency
-        pil_img_original = qimage_to_pil(q_image) # Use the original q_image for highest fidelity
-        image_item.pil_original_image = pil_img_original
-        image_item.pil_after_bg_removal = None
-        image_item.pil_for_display = pil_img_original.copy()
-        image_item.current_brightness_factor = 1.0
-        # Ensure pixmap on item reflects pil_for_display (it should, but good for consistency)
-        # image_item.setPixmap(QPixmap.fromImage(pil_to_qimage(image_item.pil_for_display)))
-        # The pixmap is already set from clipboard's QImage, which should be fine.
-
-        # Position the image at the paste location (scene_pos is the click point)
-        # Center the image on the click point
-        img_rect = image_item.boundingRect()
-        image_item.setPos(scene_pos - QPointF(img_rect.width() / 2, img_rect.height() / 2))
-
-        command = AddItemCommand(image_item, self.scene, "Paste Image")
-        self.undo_stack.push(command)
-        # AddItemCommand.redo() will select the item
-        print("Image pasted from clipboard.")
 
 
 if __name__ == "__main__":
