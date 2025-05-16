@@ -3,9 +3,9 @@ from io import BytesIO
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QToolBar, QDockWidget, QWidget, QVBoxLayout, QLabel, QPushButton, QRadioButton,
     QGraphicsRectItem, QGraphicsEllipseItem, QToolButton, QMenu, QColorDialog, QGraphicsLineItem, QFileDialog, QGraphicsPixmapItem, QMessageBox,
-    QMenuBar, QSlider, QSpinBox, QGraphicsPathItem # Added QGraphicsPathItem here
+    QMenuBar, QSlider, QSpinBox, QGraphicsPathItem, QGraphicsPolygonItem, QHBoxLayout, QStyleOptionGraphicsItem # Added QStyleOptionGraphicsItem
 )
-from PySide6.QtGui import QAction, QIcon, QColor, QPainter, QPen, QBrush, QImage, QPixmap, QPainterPath # Removed from here
+from PySide6.QtGui import QAction, QIcon, QColor, QPainter, QPen, QBrush, QImage, QPixmap, QPainterPath, QPolygonF, QTransform # Added QTransform
 from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, QBuffer
 
 # Import for background removal
@@ -119,6 +119,7 @@ class CustomGraphicsView(QGraphicsView):
         self.current_resize_handle_type = None
         self.resize_start_pos_scene = None
         self.original_item_rect_on_resize_start = None
+        self.original_item_scale_on_resize_start = None # Added for scaling
 
     def mousePressEvent(self, event):
         tool = self.parent_window.current_tool
@@ -147,10 +148,14 @@ class CustomGraphicsView(QGraphicsView):
                         self.current_resize_handle_type = item_at_click.handle_type
                         self.resize_start_pos_scene = self.start_pos_scene
                         if self.item_being_resized:
-                            if isinstance(self.item_being_resized, QGraphicsPixmapItem):
-                                self.original_item_rect_on_resize_start = self.item_being_resized.boundingRect()
-                            else: # RectItem, EllipseItem
+                            # Store original rect and scale for resize operation
+                            if isinstance(self.item_being_resized, (QGraphicsRectItem, QGraphicsEllipseItem)):
                                 self.original_item_rect_on_resize_start = self.item_being_resized.rect()
+                            else: # For Pixmap, Path, Polygon, Line, use boundingRect
+                                self.original_item_rect_on_resize_start = self.item_being_resized.boundingRect()
+                            
+                            self.original_item_scale_on_resize_start = self.item_being_resized.scale()
+
                         else:
                             self.current_resize_handle_type = None
                             super().mousePressEvent(event) # Fallback
@@ -255,38 +260,49 @@ class CustomGraphicsView(QGraphicsView):
 
             # Apply resize logic based on handle type
             if self.current_resize_handle_type == "se": # Standard item SE resize
-                if isinstance(self.item_being_resized, QGraphicsPixmapItem):
-                    # --- QGraphicsPixmapItem SE Resize (Scaling) ---
-                    new_br_width = self.original_item_rect_on_resize_start.width() + dx
-                    new_br_height = self.original_item_rect_on_resize_start.height() + dy
+                original_rect_local = self.original_item_rect_on_resize_start # This is rect/boundingRect in local coords
+                
+                if isinstance(self.item_being_resized, (QGraphicsRectItem, QGraphicsEllipseItem)):
+                    new_local_rect = QRectF(original_rect_local)
+                    # dx and dy are already in the item's local coordinate system.
+                    new_local_rect.setBottomRight(QPointF(new_local_rect.bottomRight().x() + dx, new_local_rect.bottomRight().y() + dy))
+                    if new_local_rect.width() < MIN_SHAPE_SIZE: new_local_rect.setWidth(MIN_SHAPE_SIZE)
+                    if new_local_rect.height() < MIN_SHAPE_SIZE: new_local_rect.setHeight(MIN_SHAPE_SIZE)
+                    self.item_being_resized.setRect(new_local_rect.normalized())
+                
+                elif isinstance(self.item_being_resized, (QGraphicsPixmapItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsLineItem)):
+                    # Proportional scaling for these types using SE handle
+                    # dx is local change in width if handle was at bottom-right of original_rect_local
+                    desired_new_local_width = original_rect_local.width() + dx
+                    if desired_new_local_width < MIN_SHAPE_SIZE: desired_new_local_width = MIN_SHAPE_SIZE
 
-                    if self.item_being_resized.pixmap().width() == 0 or self.item_being_resized.pixmap().height() == 0: return
+                    current_item_initial_scale = self.original_item_scale_on_resize_start 
                     
-                    if new_br_width < MIN_SHAPE_SIZE: new_br_width = MIN_SHAPE_SIZE
-                    if new_br_height < MIN_SHAPE_SIZE: new_br_height = MIN_SHAPE_SIZE
-                    
-                    new_scale_x = new_br_width / self.item_being_resized.pixmap().width()
-                    # For proportional SE resize on images:
-                    if self.parent_window.keep_image_aspect_ratio_on_resize:
-                        self.item_being_resized.setScale(new_scale_x) 
+                    base_width_for_scaling = 0
+                    if isinstance(self.item_being_resized, QGraphicsPixmapItem):
+                        # For pixmaps, base width is its unscaled pixmap width.
+                        base_width_for_scaling = self.item_being_resized.pixmap().width() 
                     else: 
-                        # Non-proportional: Need to use QTransform for non-uniform scaling
-                        # This is more complex. For now, SE on image is proportional.
-                        # If non-proportional is needed, we would calculate new_scale_y independently:
-                        # new_scale_y = new_br_height / self.item_being_resized.pixmap().height()
-                        # And then use: 
-                        # transform = QTransform().scale(new_scale_x, new_scale_y)
-                        # self.item_being_resized.setTransform(transform)
-                        # This requires current_resize_handle_type to be more granular or adjust origin point.
-                        # Sticking to setScale for simplicity, which is uniform.
-                        self.item_being_resized.setScale(new_scale_x) # Effectively proportional due to setScale
+                        # For Path, Polygon, Line: their "base width" is effectively their 
+                        # bounding rect width when their scale is 1.0.
+                        # original_rect_local.width() is the width at current_item_initial_scale.
+                        # So, base_width = original_rect_local.width() / current_item_initial_scale
+                        if current_item_initial_scale != 0:
+                            base_width_for_scaling = original_rect_local.width() / current_item_initial_scale
+                        else: # Item scale is 0, use original_rect_local.width as base (will result in 0 scale if width is 0)
+                            base_width_for_scaling = original_rect_local.width()
 
-                else: # For QGraphicsRectItem, QGraphicsEllipseItem (Shapes)
-                    new_rect.setBottomRight(QPointF(new_rect.bottomRight().x() + dx, new_rect.bottomRight().y() + dy))
-                    # Enforce minimum size for shapes before setting rect
-                    if new_rect.width() < MIN_SHAPE_SIZE: new_rect.setWidth(MIN_SHAPE_SIZE)
-                    if new_rect.height() < MIN_SHAPE_SIZE: new_rect.setHeight(MIN_SHAPE_SIZE)
-                    self.item_being_resized.setRect(new_rect.normalized())
+
+                    if base_width_for_scaling > 0:
+                        new_scale_value = desired_new_local_width / base_width_for_scaling
+                        if new_scale_value < (MIN_SHAPE_SIZE / base_width_for_scaling) and desired_new_local_width == MIN_SHAPE_SIZE : # ensure min size is respected via scale
+                             pass # new_scale_value is already minimal to achieve MIN_SHAPE_SIZE if base_width is not 0
+                        elif new_scale_value * base_width_for_scaling < MIN_SHAPE_SIZE : # general check if scaling down too much
+                             new_scale_value = MIN_SHAPE_SIZE / base_width_for_scaling
+
+
+                        self.item_being_resized.setScale(new_scale_value)
+                    # else: item has no base width or original scale was 0, cannot meaningfully scale.
             
             # --- Crop Handle Resizing Logic (item_being_resized is crop_overlay_rect) ---
             elif self.current_resize_handle_type == "nw_crop":
@@ -323,25 +339,36 @@ class CustomGraphicsView(QGraphicsView):
             return
         
         # --- Drawing tools preview logic ---
-        elif self.start_pos_scene and (event.buttons() & Qt.MouseButton.LeftButton) and tool in ["rectangle", "ellipse", "line"]:
+        elif self.start_pos_scene and (event.buttons() & Qt.MouseButton.LeftButton) and tool in ["rectangle", "ellipse", "line", "triangle"]:
             # current_pos_scene is already available
             if self.current_preview_item_view:
                 self.scene().removeItem(self.current_preview_item_view)
                 self.current_preview_item_view = None
             
-            pen = QPen(theme_colors["preview_dash_color"]) # Use themed preview color
-            pen.setStyle(Qt.PenStyle.DashLine)
+            preview_pen = QPen(theme_colors["preview_dash_color"]) # Use themed preview color
+            preview_pen.setStyle(Qt.PenStyle.DashLine)
+
+            bounding_rect = QRectF(self.start_pos_scene, current_pos_scene).normalized()
 
             if tool == "rectangle":
-                self.current_preview_item_view = QGraphicsRectItem(QRectF(self.start_pos_scene, current_pos_scene).normalized())
+                self.current_preview_item_view = QGraphicsRectItem(bounding_rect)
             elif tool == "ellipse":
-                self.current_preview_item_view = QGraphicsEllipseItem(QRectF(self.start_pos_scene, current_pos_scene).normalized())
+                self.current_preview_item_view = QGraphicsEllipseItem(bounding_rect)
             elif tool == "line":
                 self.current_preview_item_view = QGraphicsLineItem(self.start_pos_scene.x(), self.start_pos_scene.y(),
                                                                    current_pos_scene.x(), current_pos_scene.y())
+            elif tool == "triangle":
+                p1 = QPointF(bounding_rect.center().x(), bounding_rect.top())
+                p2 = QPointF(bounding_rect.left(), bounding_rect.bottom())
+                p3 = QPointF(bounding_rect.right(), bounding_rect.bottom())
+                polygon = QPolygonF([p1, p2, p3])
+                self.current_preview_item_view = QGraphicsPolygonItem(polygon)
             
             if self.current_preview_item_view:
-                self.current_preview_item_view.setPen(pen)
+                self.current_preview_item_view.setPen(preview_pen)
+                # For shapes that can have a fill, make preview fill transparent
+                if tool in ["rectangle", "ellipse", "triangle"]:
+                     self.current_preview_item_view.setBrush(Qt.BrushStyle.NoBrush)
                 self.scene().addItem(self.current_preview_item_view)
             return # Handled drawing move
         elif tool == "eraser" and self.is_erasing_active and (event.buttons() & Qt.MouseButton.LeftButton):
@@ -398,14 +425,13 @@ class CustomGraphicsView(QGraphicsView):
         tool = self.parent_window.current_tool
         current_pos_scene = self.mapToScene(event.position().toPoint()) # Defined for general use
 
+        item_that_was_resized = None
         if self.item_being_resized and event.button() == Qt.MouseButton.LeftButton:
-            # This handles release for both item resize and crop_overlay_rect resize
             print(f"Resizing finished for: {self.item_being_resized}, handle: {self.current_resize_handle_type}")
+            item_that_was_resized = self.item_being_resized # Store before clearing
             if self.item_being_resized == self.parent_window.crop_overlay_rect:
-                # Final update to crop handles based on new crop_overlay_rect
                 self.parent_window._update_crop_handles()
             else:
-                # Final update for regular item resize handles
                  if self.parent_window.selected_item:
                      self.parent_window._update_resize_handles_for_item(self.parent_window.selected_item)
             
@@ -413,30 +439,49 @@ class CustomGraphicsView(QGraphicsView):
             self.current_resize_handle_type = None
             self.resize_start_pos_scene = None
             self.original_item_rect_on_resize_start = None
+            self.original_item_scale_on_resize_start = None
             event.accept()
+
+            # After mouse resize, update properties panel for the item that was resized, if it's a pixmap
+            if item_that_was_resized and isinstance(item_that_was_resized, QGraphicsPixmapItem) and item_that_was_resized == self.parent_window.selected_item:
+                self.parent_window._update_image_size_spinboxes(item_that_was_resized)
             return
 
         # --- Drawing tools finalization logic ---
-        if event.button() == Qt.MouseButton.LeftButton and self.start_pos_scene and tool in ["rectangle", "ellipse", "line"]:
-            current_pos_scene = self.mapToScene(event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and self.start_pos_scene and tool in ["rectangle", "ellipse", "line", "triangle"]:
             if self.current_preview_item_view:
                 self.scene().removeItem(self.current_preview_item_view)
                 self.current_preview_item_view = None
 
             final_item = None
             outline_color = self.parent_window.current_theme_colors["item_default_outline"]
+            fill_color = self.parent_window.current_theme_colors["item_default_fill"]
             pen = QPen(outline_color)
+            brush = QBrush(fill_color)
 
-            if tool == "rectangle" or tool == "ellipse":
-                final_rect = QRectF(self.start_pos_scene, current_pos_scene).normalized()
-                if final_rect.width() >= MIN_SHAPE_SIZE and final_rect.height() >= MIN_SHAPE_SIZE:
-                    fill_color = self.parent_window.current_theme_colors["item_default_fill"]
-                    if tool == "rectangle":
-                        final_item = QGraphicsRectItem(final_rect)
-                    elif tool == "ellipse":
-                        final_item = QGraphicsEllipseItem(final_rect)
-                    if final_item:
-                        final_item.setBrush(QBrush(fill_color))
+            final_bounding_rect = QRectF(self.start_pos_scene, current_pos_scene).normalized()
+
+            if tool == "rectangle" or tool == "ellipse" or tool == "triangle":
+                # Ensure minimum size for shapes based on bounding box
+                if final_bounding_rect.width() < MIN_SHAPE_SIZE or final_bounding_rect.height() < MIN_SHAPE_SIZE:
+                    self.start_pos_scene = None # Reset to prevent accidental small shape
+                    return
+
+                if tool == "rectangle":
+                    final_item = QGraphicsRectItem(final_bounding_rect)
+                elif tool == "ellipse":
+                    final_item = QGraphicsEllipseItem(final_bounding_rect)
+                elif tool == "triangle":
+                    p1 = QPointF(final_bounding_rect.center().x(), final_bounding_rect.top())
+                    p2 = QPointF(final_bounding_rect.left(), final_bounding_rect.bottom())
+                    p3 = QPointF(final_bounding_rect.right(), final_bounding_rect.bottom())
+                    polygon = QPolygonF([p1, p2, p3])
+                    final_item = QGraphicsPolygonItem(polygon)
+                    if final_item: final_item.shape_type = "triangle" # Custom attribute
+                
+                if final_item and tool in ["rectangle", "ellipse", "triangle"]:
+                    final_item.setBrush(brush)
+
             elif tool == "line":
                 # Check for minimal length for a line, if desired (e.g., avoid zero-length lines)
                 if (self.start_pos_scene - current_pos_scene).manhattanLength() > MIN_SHAPE_SIZE / 2:
@@ -672,6 +717,10 @@ class CanvasWindow(QMainWindow):
         pen_tool_action = QAction("Pen", self)
         pen_tool_action.triggered.connect(lambda: self.set_tool("pen"))
         self.shape_menu.addAction(pen_tool_action)
+
+        triangle_action = QAction("Triangle", self)
+        triangle_action.triggered.connect(lambda: self.set_tool("triangle"))
+        self.shape_menu.addAction(triangle_action)
         # Add more shape actions here later
 
         self.shape_tool_button.setMenu(self.shape_menu)
@@ -724,6 +773,49 @@ class CanvasWindow(QMainWindow):
         
         view_menu.addSeparator()
         view_menu.addAction(change_canvas_bg_action) # Also add to menu for discoverability
+
+        # --- Arrange Menu (New) ---
+        arrange_menu = menubar.addMenu("Arrange")
+
+        bring_to_front_action = QAction("Bring to Front", self)
+        bring_to_front_action.triggered.connect(self.bring_selected_to_front)
+        arrange_menu.addAction(bring_to_front_action)
+        # self.toolbar.addAction(bring_to_front_action) # Add to toolbar later if desired
+
+        send_to_back_action = QAction("Send to Back", self)
+        send_to_back_action.triggered.connect(self.send_selected_to_back)
+        arrange_menu.addAction(send_to_back_action)
+        # self.toolbar.addAction(send_to_back_action)
+
+        bring_forward_action = QAction("Bring Forward", self)
+        bring_forward_action.triggered.connect(self.bring_selected_forward)
+        arrange_menu.addAction(bring_forward_action)
+        # self.toolbar.addAction(bring_forward_action)
+
+        send_backward_action = QAction("Send Backward", self)
+        send_backward_action.triggered.connect(self.send_selected_backward)
+        arrange_menu.addAction(send_backward_action)
+        # self.toolbar.addAction(send_backward_action)
+        
+        # Add a separator in toolbar before arrange actions if adding them there
+        # self.toolbar.addSeparator() 
+        # Example: Add "Bring to Front" and "Send to Back" to toolbar for quick access
+        self.toolbar.addAction(bring_to_front_action)
+        self.toolbar.addAction(send_to_back_action)
+
+        # --- File Menu (New or Existing) ---
+        # Check if File menu exists, if not create it
+        file_menu = None
+        for menu in menubar.findChildren(QMenu):
+            if menu.title() == "File":
+                file_menu = menu
+                break
+        if not file_menu:
+            file_menu = menubar.addMenu("File")
+
+        save_image_as_action = QAction("Save Image As...", self)
+        save_image_as_action.triggered.connect(self.save_selected_image_as)
+        file_menu.addAction(save_image_as_action)
 
         # --- Properties Panel ---
         self.properties_dock = QDockWidget("Properties", self)
@@ -778,6 +870,51 @@ class CanvasWindow(QMainWindow):
         self.cancel_crop_button.clicked.connect(lambda: self.exit_crop_mode(apply_changes=False))
         self.properties_layout.addWidget(self.cancel_crop_button)
 
+        # Rotation Controls (for images)
+        self.rotation_label = QLabel("Rotation:")
+        self.properties_layout.addWidget(self.rotation_label)
+        self.rotation_slider = QSlider(Qt.Orientation.Horizontal)
+        self.rotation_slider.setMinimum(0)
+        self.rotation_slider.setMaximum(359) # Degrees
+        self.rotation_slider.setValue(0)
+        self.rotation_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.rotation_slider.setTickInterval(45)
+        self.rotation_slider.valueChanged.connect(self.on_rotation_slider_changed)
+        self.properties_layout.addWidget(self.rotation_slider)
+        self.rotation_value_label = QLabel("0°")
+        self.properties_layout.addWidget(self.rotation_value_label)
+
+        # --- Image Size Controls (New) ---
+        self.image_size_label = QLabel("Current Size:") # Overall label
+        self.properties_layout.addWidget(self.image_size_label)
+        
+        self.image_width_label = QLabel("W:")
+        self.image_width_spinbox = QSpinBox()
+        self.image_width_spinbox.setRange(1, 10000) # Min 1px, Max 10000px
+        # self.image_width_spinbox.valueChanged.connect(self.on_image_width_changed)
+        self.image_width_spinbox.editingFinished.connect(self.on_image_width_editing_finished)
+        
+        self.image_height_label = QLabel("H:")
+        self.image_height_spinbox = QSpinBox()
+        self.image_height_spinbox.setRange(1, 10000)
+        # self.image_height_spinbox.valueChanged.connect(self.on_image_height_changed)
+        self.image_height_spinbox.editingFinished.connect(self.on_image_height_editing_finished)
+
+        # Layout for width and height side-by-side
+        size_control_layout = QHBoxLayout() 
+        size_control_layout.addWidget(self.image_width_label)
+        size_control_layout.addWidget(self.image_width_spinbox)
+        size_control_layout.addSpacing(10) 
+        size_control_layout.addWidget(self.image_height_label)
+        size_control_layout.addWidget(self.image_height_spinbox)
+        size_control_layout.addStretch() 
+        self.properties_layout.addLayout(size_control_layout)
+
+        # --- Save Image Button (Moved/New) ---
+        self.save_image_button = QPushButton("Save Image As...")
+        self.save_image_button.clicked.connect(self.save_selected_image_as)
+        self.properties_layout.addWidget(self.save_image_button)
+
         # Pen Tool Properties (visible when pen tool is active)
         self.pen_color_label = QLabel("Pen Color:")
         self.properties_layout.addWidget(self.pen_color_label)
@@ -802,7 +939,10 @@ class CanvasWindow(QMainWindow):
         self.start_crop_button.setVisible(False)
         self.apply_crop_button.setVisible(False)
         self.cancel_crop_button.setVisible(False)
-        self.pen_color_label.setVisible(False) # Hide by default
+        self.rotation_label.setVisible(False) # Hide by default
+        self.rotation_slider.setVisible(False)
+        self.rotation_value_label.setVisible(False)
+        self.pen_color_label.setVisible(False)
         self.change_pen_color_button.setVisible(False)
         self.current_pen_color_preview.setVisible(False)
         self.pen_width_label.setVisible(False)
@@ -821,24 +961,32 @@ class CanvasWindow(QMainWindow):
         selected_items = self.scene.selectedItems()
         self._remove_resize_handles() # Clear old handles first
 
+        old_selected_item = self.selected_item # Keep track of previously selected item
+
         if selected_items:
-            self.selected_item = selected_items[0] # Assuming single selection for now
-            # Create resize handles for the newly selected item
-            # We only add handles if the select tool is active, or perhaps always show them?
-            # For now, let's always show them on selection.
-            if isinstance(self.selected_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPixmapItem)):
-                 # For Ellipse and Pixmap, ensure they have a rect() method or adapt handle creation
-                 # QGraphicsPixmapItem has boundingRect(), QGraphicsEllipseItem has rect()
+            self.selected_item = selected_items[0] 
+            if isinstance(self.selected_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem)):
+                # Check if selection actually changed or if it's a re-selection of the same item
+                # or if the item was modified (e.g. resized by mouse, triggering selection change signals)
+                # Forcing handle update here is good if item was modified.
                 self._create_resize_handles_for_item(self.selected_item)
             print(f"Selected: {self.selected_item}")
         else:
             self.selected_item = None
             print("Selection cleared")
 
+        # Update properties panel. This will also call _update_image_size_spinboxes if an image is selected.
         self._update_properties_panel_for_selection()
 
+        # If selection changed FROM an image TO something else (or nothing),
+        # and crop mode was active for that image, exit crop mode.
+        if self.current_crop_item and self.current_crop_item != self.selected_item:
+             if old_selected_item == self.current_crop_item:
+                 print("Selection changed away from item in crop mode. Cancelling crop.")
+                 self.exit_crop_mode(apply_changes=False)
+
     def update_shape_tool_button_text(self):
-        if self.current_tool in ["rectangle", "ellipse", "line", "pen"] and self.current_shape_tool_action:
+        if self.current_tool in ["rectangle", "ellipse", "line", "pen", "triangle"] and self.current_shape_tool_action:
             self.shape_tool_button.setText(self.current_shape_tool_action.text())
         else:
             # Default or if a non-shape tool is active but we want to show last shape
@@ -850,18 +998,28 @@ class CanvasWindow(QMainWindow):
             try: self.pen_width_spinbox.valueChanged.disconnect(self.on_pen_width_changed) 
             except RuntimeError: pass # If not connected, fine
 
+        previous_tool = self.current_tool
         self.current_tool = tool_name
         print(f"Tool changed to: {self.current_tool}")
 
+        if tool_name == "pen" and previous_tool != "pen": # Only prompt if switching TO pen tool
+            # Prompt for color when Pen tool is selected
+            new_color = QColorDialog.getColor(self.current_pen_color, self, "Choose Pen Color",
+                                              options=QColorDialog.ColorDialogOption.DontUseNativeDialog)
+            if new_color.isValid():
+                self.current_pen_color = new_color
+            # If user cancels, current_pen_color remains as it was
+
         # Uncheck main tools if a shape tool is selected from dropdown
-        if tool_name in ["rectangle", "ellipse", "line", "pen"]:
+        if tool_name in ["rectangle", "ellipse", "line", "pen", "triangle"]:
             for action in self.main_tool_actions_group:
                 action.setChecked(False)
             # Update current_shape_tool_action based on tool_name
             if tool_name == "rectangle": self.current_shape_tool_action = self.shape_menu.actions()[0]
             elif tool_name == "ellipse": self.current_shape_tool_action = self.shape_menu.actions()[1]
             elif tool_name == "line": self.current_shape_tool_action = self.shape_menu.actions()[2]
-            elif tool_name == "pen": self.current_shape_tool_action = self.shape_menu.actions()[3] # Assuming Pen is 4th
+            elif tool_name == "pen": self.current_shape_tool_action = self.shape_menu.actions()[3]
+            elif tool_name == "triangle": self.current_shape_tool_action = self.shape_menu.actions()[4] # Assuming Triangle is 5th
             self.update_shape_tool_button_text()
             self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.view.setInteractive(False) # Drawing tools manage interaction
@@ -903,22 +1061,25 @@ class CanvasWindow(QMainWindow):
         self.active_resize_handles.clear()
 
     def _create_resize_handles_for_item(self, parent_item):
-        self._remove_resize_handles() # Clear existing before creating new
-        
-        theme_colors = self.current_theme_colors # Use current theme for handles
+        self._remove_resize_handles() 
+        theme_colors = self.current_theme_colors
 
-        # Determine rect based on item type
-        if isinstance(parent_item, QGraphicsPixmapItem):
-            item_rect = parent_item.boundingRect() # For pixmaps, boundingRect is in item's coords
-        elif isinstance(parent_item, (QGraphicsRectItem, QGraphicsEllipseItem)):
-            item_rect = parent_item.rect() # For shapes, rect is fine
+        item_rect_for_handles = None
+        if isinstance(parent_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem)):
+            item_rect_for_handles = parent_item.boundingRect()
+            # Basic check for validity, though boundingRect should generally be valid if item is visible
+            if item_rect_for_handles.isEmpty() and not (isinstance(parent_item, QGraphicsLineItem) and parent_item.line().length() == 0): # Allow zero-length line if just drawn
+                 print(f"Cannot create handles for item {parent_item} with empty bounding rect.")
+                 return 
         else:
-            return # No handles for other types yet
+            return # No handles for other types
 
-        # SE handle (bottom-right)
-        se_pos = QPointF(item_rect.right() - HANDLE_SIZE / 2, item_rect.bottom() - HANDLE_SIZE / 2)
-        se_handle = QGraphicsRectItem(0, 0, HANDLE_SIZE, HANDLE_SIZE, parent_item)
-        se_handle.setPos(se_pos)
+        # SE handle (bottom-right of the bounding rect in item's local coords)
+        se_pos_x = item_rect_for_handles.right() - HANDLE_SIZE / 2
+        se_pos_y = item_rect_for_handles.bottom() - HANDLE_SIZE / 2
+        
+        se_handle = QGraphicsRectItem(0, 0, HANDLE_SIZE, HANDLE_SIZE, parent_item) 
+        se_handle.setPos(QPointF(se_pos_x, se_pos_y)) 
         se_handle.setBrush(theme_colors["selected_handle_fill"])
         se_handle.setPen(QPen(theme_colors["selected_handle_outline"]))
         se_handle.is_resize_handle = True
@@ -926,23 +1087,30 @@ class CanvasWindow(QMainWindow):
         self.active_resize_handles.append(se_handle)
 
     def _update_resize_handles_for_item(self, parent_item):
-        if not self.active_resize_handles or not parent_item: return
-        
-        # Determine rect based on item type
-        if isinstance(parent_item, QGraphicsPixmapItem):
-            item_rect = parent_item.boundingRect()
-        elif isinstance(parent_item, (QGraphicsRectItem, QGraphicsEllipseItem)):
-            item_rect = parent_item.rect()
-        else:
+        if not self.active_resize_handles or not parent_item: 
+            # If no parent_item, but handles exist, they are orphaned, remove them.
+            if not parent_item and self.active_resize_handles:
+                self._remove_resize_handles()
             return
-            
+        
+        item_rect_for_handles = None
+        if isinstance(parent_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem)):
+            item_rect_for_handles = parent_item.boundingRect()
+            if item_rect_for_handles.isEmpty() and not (isinstance(parent_item, QGraphicsLineItem) and parent_item.line().length() == 0):
+                self._remove_resize_handles() # Remove handles if item's rect becomes invalid
+                return
+        else:
+            self._remove_resize_handles() 
+            return
+        
         for handle in self.active_resize_handles:
             if handle.handle_type == "se":
-                handle.setPos(item_rect.right() - HANDLE_SIZE / 2, item_rect.bottom() - HANDLE_SIZE / 2)
-                # Also update handle colors in case theme changed while selected
+                se_pos_x = item_rect_for_handles.right() - HANDLE_SIZE / 2
+                se_pos_y = item_rect_for_handles.bottom() - HANDLE_SIZE / 2
+                handle.setPos(QPointF(se_pos_x, se_pos_y))
                 handle.setBrush(self.current_theme_colors["selected_handle_fill"])
                 handle.setPen(QPen(self.current_theme_colors["selected_handle_outline"]))
-    
+
     def _update_properties_panel_for_selection(self):
         # Default to all conditional widgets hidden
         self.fill_color_button.setVisible(False)
@@ -956,27 +1124,43 @@ class CanvasWindow(QMainWindow):
         self.start_crop_button.setVisible(False)
         self.apply_crop_button.setVisible(False)
         self.cancel_crop_button.setVisible(False)
-        self.pen_color_label.setVisible(False) # Hide by default
+        self.rotation_label.setVisible(False) 
+        self.rotation_slider.setVisible(False)
+        self.rotation_value_label.setVisible(False)
+        self.pen_color_label.setVisible(False)
         self.change_pen_color_button.setVisible(False)
         self.current_pen_color_preview.setVisible(False)
         self.pen_width_label.setVisible(False)
         self.pen_width_spinbox.setVisible(False)
 
+        # Hide new image controls initially
+        self.image_size_label.setVisible(False)
+        self.image_width_label.setVisible(False)
+        self.image_width_spinbox.setVisible(False)
+        self.image_height_label.setVisible(False)
+        self.image_height_spinbox.setVisible(False)
+        self.save_image_button.setVisible(False)
+
+        theme_colors = self.current_theme_colors
+
         if self.selected_item:
             item = self.selected_item
-            item_type_str = "Unknown"
-            theme_colors = self.current_theme_colors # For contrasting text
+            item_type_str = type(item).__name__ # Default item type string
 
-            # Default visibility for pen tool's own properties (when an item is selected but it's not the pen tool itself active)
-            self.pen_color_label.setVisible(False)
-            self.change_pen_color_button.setVisible(False)
-            self.change_pen_color_button.setText("Change Pen Color") # Reset text
-            self.current_pen_color_preview.setVisible(False)
-            self.pen_width_label.setVisible(False)
-            self.pen_width_spinbox.setVisible(False)
+            # Determine capabilities
+            can_fill_outline = isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPolygonItem))
+            is_line = isinstance(item, QGraphicsLineItem)
+            is_pen_stroke = isinstance(item, QGraphicsPathItem) and hasattr(item, 'item_type') and item.item_type == 'pen_stroke'
+            is_managed_image = isinstance(item, QGraphicsPixmapItem) and hasattr(item, 'pil_original_image')
+            can_rotate = isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsPixmapItem))
 
-            if isinstance(item, QGraphicsRectItem):
-                item_type_str = "Rectangle"
+            if can_fill_outline:
+                item_type_str = "Shape" # Generic shape, can be refined
+                if isinstance(item, QGraphicsRectItem): item_type_str = "Rectangle"
+                elif isinstance(item, QGraphicsEllipseItem): item_type_str = "Ellipse"
+                elif isinstance(item, QGraphicsPolygonItem) and hasattr(item, 'shape_type') and item.shape_type == 'triangle': item_type_str = "Triangle"
+                elif isinstance(item, QGraphicsPolygonItem): item_type_str = "Polygon"
+                
                 self.fill_color_button.setVisible(True)
                 self.current_fill_color_label.setVisible(True)
                 self.outline_color_button.setVisible(True)
@@ -987,47 +1171,85 @@ class CanvasWindow(QMainWindow):
                 outline_color = item.pen().color()
                 self.current_outline_color_label.setText(f"Outline: {outline_color.name()}")
                 self.current_outline_color_label.setStyleSheet(f"background-color: {outline_color.name()}; color: {self.get_contrasting_text_color(outline_color, theme_colors).name()}")
-            elif isinstance(item, QGraphicsEllipseItem):
-                item_type_str = "Ellipse"
-                self.fill_color_button.setVisible(True)
-                self.current_fill_color_label.setVisible(True)
-                self.outline_color_button.setVisible(True)
-                self.current_outline_color_label.setVisible(True)
-                fill_color = item.brush().color()
-                self.current_fill_color_label.setText(f"Fill: {fill_color.name()}")
-                self.current_fill_color_label.setStyleSheet(f"background-color: {fill_color.name()}; color: {self.get_contrasting_text_color(fill_color, theme_colors).name()}")
-                outline_color = item.pen().color()
-                self.current_outline_color_label.setText(f"Outline: {outline_color.name()}")
-                self.current_outline_color_label.setStyleSheet(f"background-color: {outline_color.name()}; color: {self.get_contrasting_text_color(outline_color, theme_colors).name()}")
-            elif isinstance(item, QGraphicsLineItem):
+
+            if is_line:
                 item_type_str = "Line"
                 self.outline_color_button.setVisible(True)
                 self.current_outline_color_label.setVisible(True)
                 self.current_fill_color_label.setText("Fill: N/A")
-                self.current_fill_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()};")
+                self.current_fill_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()}; background-color: transparent;")
                 outline_color = item.pen().color()
                 self.current_outline_color_label.setText(f"Outline: {outline_color.name()}")
                 self.current_outline_color_label.setStyleSheet(f"background-color: {outline_color.name()}; color: {self.get_contrasting_text_color(outline_color, theme_colors).name()}")
-            elif isinstance(item, QGraphicsPathItem) and hasattr(item, 'item_type') and item.item_type == 'pen_stroke':
+
+            if is_pen_stroke:
                 item_type_str = "Pen Stroke"
                 self.pen_color_label.setVisible(True)
                 self.change_pen_color_button.setVisible(True)
-                self.change_pen_color_button.setText("Change Stroke Color") # Relabel for context
+                self.change_pen_color_button.setText("Change Stroke Color")
                 self.current_pen_color_preview.setVisible(True)
                 self.current_pen_color_preview.setStyleSheet(f"color: {item.pen().color().name()}; font-size: 20px;")
                 self.pen_width_label.setVisible(True)
                 self.pen_width_spinbox.setVisible(True)
-                
-                # Update spinbox value for selected stroke without triggering its own signal:
                 self.pen_width_spinbox.blockSignals(True)
                 self.pen_width_spinbox.setValue(int(item.pen().widthF()))
                 self.pen_width_spinbox.blockSignals(False)
-
-                # Hide other irrelevant properties
+                # Hide shape fill/outline if it's a pen stroke, as it's controlled by pen props
                 self.fill_color_button.setVisible(False)
                 self.current_fill_color_label.setVisible(False)
                 self.outline_color_button.setVisible(False)
                 self.current_outline_color_label.setVisible(False)
+
+            if is_managed_image:
+                item_type_str = "Image"
+                self.remove_bg_button.setVisible(True)
+                self.brightness_label.setVisible(True)
+                self.brightness_slider.setVisible(True)
+                self.brightness_value_label.setVisible(True)
+                self.start_crop_button.setVisible(True)
+                self.apply_crop_button.setVisible(self.current_crop_item == item)
+                self.cancel_crop_button.setVisible(self.current_crop_item == item)
+                self.save_image_button.setVisible(True) 
+
+                self.image_size_label.setVisible(True)
+                self.image_width_label.setVisible(True)
+                self.image_width_spinbox.setVisible(True)
+                self.image_height_label.setVisible(True)
+                self.image_height_spinbox.setVisible(True)
+                self._update_image_size_spinboxes(item) # Call helper here
+                
+                if not self.current_crop_item or self.current_crop_item != item:
+                    slider_val = int(item.current_brightness_factor * 100)
+                    self.brightness_slider.blockSignals(True)
+                    self.brightness_slider.setValue(slider_val)
+                    self.brightness_slider.blockSignals(False)
+                    self.brightness_value_label.setText(f"{slider_val}%")
+                
+                # Hide shape fill/outline for images
+                self.fill_color_button.setVisible(False)
+                self.current_fill_color_label.setVisible(False)
+                self.current_fill_color_label.setText("Fill: N/A")
+                self.current_fill_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()}; background-color: transparent;")
+                self.current_outline_color_label.setText("Outline: N/A")
+                self.current_outline_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()}; background-color: transparent;")
+
+            if can_rotate:
+                self.rotation_label.setVisible(True)
+                self.rotation_slider.setVisible(True)
+                self.rotation_value_label.setVisible(True)
+                self.rotation_slider.blockSignals(True)
+                self.rotation_slider.setValue(int(item.rotation()))
+                self.rotation_slider.blockSignals(False)
+                self.rotation_value_label.setText(f"{int(item.rotation())}°")
+            
+            # If not an image, ensure image-specific controls are hidden
+            if not is_managed_image:
+                self.image_size_label.setVisible(False)
+                self.image_width_label.setVisible(False)
+                self.image_width_spinbox.setVisible(False)
+                self.image_height_label.setVisible(False)
+                self.image_height_spinbox.setVisible(False)
+                self.save_image_button.setVisible(False)
                 self.remove_bg_button.setVisible(False)
                 self.brightness_label.setVisible(False)
                 self.brightness_slider.setVisible(False)
@@ -1036,47 +1258,34 @@ class CanvasWindow(QMainWindow):
                 self.apply_crop_button.setVisible(False)
                 self.cancel_crop_button.setVisible(False)
 
-            elif isinstance(item, QGraphicsPixmapItem):
-                item_type_str = "Image"
-                self.remove_bg_button.setVisible(True)
-                self.current_fill_color_label.setText("Fill: N/A")
-                self.current_fill_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()};")
-                self.current_outline_color_label.setText("Outline: N/A")
-                self.current_outline_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()};")
-            
-            # Show image-specific properties if it's one of our managed image items
-            if hasattr(item, 'pil_original_image'):
-                self.remove_bg_button.setVisible(True)
-                self.brightness_label.setVisible(True)
-                self.brightness_slider.setVisible(True)
-                self.brightness_value_label.setVisible(True)
-                
-                self.start_crop_button.setVisible(True)
-                self.apply_crop_button.setVisible(self.current_crop_item == item)
-                self.cancel_crop_button.setVisible(self.current_crop_item == item)
-                
-                if not self.current_crop_item:
-                    slider_val = int(item.current_brightness_factor * 100)
-                    self.brightness_slider.setValue(slider_val)
-                    self.brightness_value_label.setText(f"{slider_val}%")
-            else: # Not an image or not one we manage PIL for, or not selected
-                self.remove_bg_button.setVisible(False)
-                self.brightness_label.setVisible(False)
-                self.brightness_slider.setVisible(False)
-                self.brightness_value_label.setVisible(False)
-                self.start_crop_button.setVisible(False)
-                self.apply_crop_button.setVisible(False)
-                self.cancel_crop_button.setVisible(False)
-            
             self.prop_label.setText(f"Selected: {item_type_str}")
-        else:
+
+        else: # No item selected
             self.prop_label.setText("Selected: None")
-            # Reset color labels for consistency when no selection
-            theme_colors = self.current_theme_colors
             self.current_fill_color_label.setText("Fill: N/A")
             self.current_fill_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()}; background-color: transparent;")
             self.current_outline_color_label.setText("Outline: N/A")
             self.current_outline_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()}; background-color: transparent;")
+
+            # Show pen tool's global properties if pen tool is active
+            if self.current_tool == "pen":
+                self.pen_color_label.setVisible(True)
+                self.change_pen_color_button.setVisible(True)
+                self.change_pen_color_button.setText("Change Pen Color")
+                self.current_pen_color_preview.setVisible(True)
+                self.current_pen_color_preview.setStyleSheet(f"color: {self.current_pen_color.name()}; font-size: 20px;")
+                self.pen_width_label.setVisible(True)
+                self.pen_width_spinbox.setVisible(True)
+                self.pen_width_spinbox.blockSignals(True)
+                self.pen_width_spinbox.setValue(int(self.current_pen_width))
+                self.pen_width_spinbox.blockSignals(False)
+            else:
+                # Ensure pen tool's own properties are hidden if no selection and pen tool isn't active
+                self.pen_color_label.setVisible(False)
+                self.change_pen_color_button.setVisible(False)
+                self.current_pen_color_preview.setVisible(False)
+                self.pen_width_label.setVisible(False)
+                self.pen_width_spinbox.setVisible(False)
 
     def get_contrasting_text_color(self, bg_color, theme_colors=None):
         # Use current theme's text color as a fallback if bg_color is transparent or similar to it
@@ -1511,6 +1720,308 @@ class CanvasWindow(QMainWindow):
             self.selected_item.setPen(pen)
             self.selected_item.update()
             print(f"Selected stroke width changed to: {new_width}")
+
+    def on_rotation_slider_changed(self, value):
+        if self.selected_item and isinstance(self.selected_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsPixmapItem)):
+            angle = float(value)
+            self.selected_item.setRotation(angle)
+            self.rotation_value_label.setText(f"{int(angle)}°")
+            self._update_resize_handles_for_item(self.selected_item) 
+        else:
+            if hasattr(self, 'rotation_value_label'): # Check if UI element exists
+                 self.rotation_value_label.setText("--°")
+
+    # --- Z-Order Methods ---
+    def _get_all_z_values(self):
+        return sorted([item.zValue() for item in self.scene.items()])
+
+    def bring_selected_to_front(self):
+        if self.selected_item:
+            all_z_values = self._get_all_z_values()
+            if all_z_values:
+                max_z = all_z_values[-1]
+                self.selected_item.setZValue(max_z + 1)
+            else: # Only item in scene
+                self.selected_item.setZValue(1) # Start with 1 if it's the first
+            self.scene.update()
+
+    def send_selected_to_back(self):
+        if self.selected_item:
+            all_z_values = self._get_all_z_values()
+            if all_z_values:
+                min_z = all_z_values[0]
+                self.selected_item.setZValue(min_z - 1)
+            else: # Only item in scene
+                self.selected_item.setZValue(-1) # Start with -1 if it's the first
+            self.scene.update()
+
+    def bring_selected_forward(self):
+        if self.selected_item:
+            current_z = self.selected_item.zValue()
+            # Find the smallest z-value strictly greater than current_z
+            next_z_values = sorted([item.zValue() for item in self.scene.items() if item.zValue() > current_z])
+            if next_z_values:
+                # If there's an item directly in front with a different z-value, 
+                # place this item just above that one. 
+                # A simple increment is usually enough if z-values are somewhat sparse.
+                # To be more robust and avoid large gaps or too small increments:
+                # Find the item that is visually just above the current one.
+                # This can be complex. A simpler approach for now is to increment. 
+                # If we want to swap with the item directly in front: 
+                # Get all items, sort by Z. Find index of current_item. 
+                # If not at top, find Z of item[index+1]. Set current_item Z to Z_item_above + epsilon.
+                # For now, just incrementing Z. This might lead to large Z values over time.
+                self.selected_item.setZValue(current_z + 1) 
+            else:
+                # Already at the front relative to other z-values, ensure it's max_z + 1 if not already
+                all_z = self._get_all_z_values()
+                if all_z and current_z < all_z[-1]: # Should not happen if next_z_values is empty
+                     self.selected_item.setZValue(all_z[-1] + 1)
+                # If it is already the highest, incrementing it further is fine.
+                elif all_z and current_z == all_z[-1]:
+                    self.selected_item.setZValue(current_z + 0.1) # Small increment to break ties or ensure it's distinct if needed
+                else: # Only item or already highest
+                    self.selected_item.setZValue(current_z + 0.1)
+
+            self.scene.update()
+
+    def send_selected_backward(self):
+        if self.selected_item:
+            current_z = self.selected_item.zValue()
+            # Find the largest z-value strictly smaller than current_z
+            prev_z_values = sorted([item.zValue() for item in self.scene.items() if item.zValue() < current_z], reverse=True)
+            if prev_z_values:
+                # Similar logic to bring_selected_forward, but decrementing.
+                self.selected_item.setZValue(current_z - 1) 
+            else:
+                # Already at the back relative to other z-values
+                all_z = self._get_all_z_values()
+                if all_z and current_z > all_z[0]:
+                    self.selected_item.setZValue(all_z[0] -1)
+                elif all_z and current_z == all_z[0]:
+                     self.selected_item.setZValue(current_z - 0.1)
+                else:
+                    self.selected_item.setZValue(current_z - 0.1)
+            self.scene.update()
+
+    # --- Image Saving Method ---
+    def save_selected_image_as(self):
+        if not self.selected_item:
+            QMessageBox.information(self, "No Selection", "Please select an item to save.")
+            return
+
+        if not isinstance(self.selected_item, QGraphicsPixmapItem):
+            QMessageBox.warning(self, "Cannot Save", "The selected item is not a savable image (e.g., shape). Please select an image.")
+            return
+
+        item_to_save = self.selected_item
+        pixmap_to_render = item_to_save.pixmap() # This should have effects applied
+
+        if pixmap_to_render.isNull():
+            QMessageBox.critical(self, "Error", "Image data is missing or invalid for the selected item.")
+            return
+
+        # Get the item's bounding rectangle in scene coordinates
+        target_rect_scene = item_to_save.sceneBoundingRect()
+        output_image_size = target_rect_scene.size().toSize()
+        
+        # Ensure minimum size for output image if rect is too small (e.g. fully scaled down)
+        if output_image_size.width() < 1 or output_image_size.height() < 1:
+            # Fallback: try to render at least the original pixmap size, or a small default
+            if not pixmap_to_render.isNull():
+                output_image_size = pixmap_to_render.size()
+            if output_image_size.width() < 1 or output_image_size.height() < 1: # Still invalid
+                 QMessageBox.warning(self, "Save Error", "Image is too small to render.")
+                 return
+
+        # Create the output QImage
+        rendered_qimage = QImage(output_image_size, QImage.Format_ARGB32_Premultiplied)
+        rendered_qimage.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(rendered_qimage)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        # The painter's world transform needs to map the item's local (pixmap) coordinates 
+        # to the correct position within our rendered_qimage.
+        # 1. Start with identity on painter for rendered_qimage.
+        # 2. We want the item_to_save.sceneBoundingRect().topLeft() to map to (0,0) in rendered_qimage.
+        #    So, translate the painter by -item_to_save.sceneBoundingRect().topLeft().
+        # 3. Then, apply the item's full sceneTransform() to the painter.
+        # 4. Draw the item's original pixmap at (0,0) in item's local coords.
+
+        painter.translate(-target_rect_scene.topLeft())
+        painter.setTransform(item_to_save.sceneTransform(), True) # True to combine with existing translation
+        
+        # Draw the source pixmap (which is in item's local coords, starting at 0,0 for pixmap item)
+        painter.drawPixmap(QPointF(0,0), pixmap_to_render) 
+        painter.end()
+
+        pil_image_to_save = qimage_to_pil(rendered_qimage)
+
+        if not pil_image_to_save:
+            QMessageBox.critical(self, "Error", "Could not render the selected image for saving.")
+            return
+
+        suggested_filename = "rendered_image.png" 
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Image As...",
+            suggested_filename, # Default/suggested filename
+            "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;Bitmap Image (*.bmp);;GIF Image (*.gif);;All Files (*)"
+        )
+
+        if file_path:
+            try:
+                # PIL infers format from extension. For formats like JPEG that don't support alpha,
+                # you might want to convert the image mode.
+                if pil_image_to_save.mode == 'RGBA' and (file_path.lower().endswith('.jpg') or file_path.lower().endswith('.jpeg')):
+                    # Convert to RGB if saving as JPEG to avoid potential errors with alpha channel
+                    image_to_save_final = pil_image_to_save.convert('RGB')
+                    image_to_save_final.save(file_path)
+                else:
+                    pil_image_to_save.save(file_path)
+                QMessageBox.information(self, "Image Saved", f"Image successfully saved to:\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", f"Could not save image:\n{e}")
+                print(f"Error saving image to {file_path}: {e}")
+        else:
+            print("Save operation cancelled by user.")
+
+    # --- Image Size Change Handlers (New) ---
+    def on_image_width_editing_finished(self):
+        if not self.selected_item or not isinstance(self.selected_item, QGraphicsPixmapItem) or not hasattr(self.selected_item, 'pil_original_image'):
+            return
+        
+        item = self.selected_item
+        desired_width = self.image_width_spinbox.value()
+        # Use the current value from the other spinbox for the other dimension
+        desired_height = self.image_height_spinbox.value() 
+
+        final_width = max(desired_width, MIN_SHAPE_SIZE)
+        final_height = max(desired_height, MIN_SHAPE_SIZE) # Constrain the other dimension too
+
+        original_pixmap = item.pixmap()
+        original_pixmap_width = original_pixmap.width()
+        original_pixmap_height = original_pixmap.height()
+
+        if original_pixmap_width == 0 or original_pixmap_height == 0:
+            # Cannot scale, reset spinboxes to some minimum or current (likely small) brect
+            self.image_width_spinbox.blockSignals(True)
+            self.image_height_spinbox.blockSignals(True)
+            self.image_width_spinbox.setValue(max(int(item.boundingRect().width()), int(MIN_SHAPE_SIZE)))
+            self.image_height_spinbox.setValue(max(int(item.boundingRect().height()), int(MIN_SHAPE_SIZE)))
+            self.image_width_spinbox.blockSignals(False)
+            self.image_height_spinbox.blockSignals(False)
+            return 
+
+        scale_x = final_width / original_pixmap_width
+        scale_y = final_height / original_pixmap_height
+
+        current_rotation = item.rotation()
+        transform = QTransform().scale(scale_x, scale_y).rotate(current_rotation)
+        item.setTransform(transform)
+        
+        self._update_resize_handles_for_item(item)
+
+        # Update spinboxes to the exact values used for scaling (after constraints)
+        self.image_width_spinbox.blockSignals(True)
+        self.image_width_spinbox.setValue(int(round(final_width)))
+        self.image_width_spinbox.blockSignals(False)
+
+        self.image_height_spinbox.blockSignals(True)
+        self.image_height_spinbox.setValue(int(round(final_height)))
+        self.image_height_spinbox.blockSignals(False)
+        
+        self.scene.update() 
+
+    def on_image_height_editing_finished(self):
+        if not self.selected_item or not isinstance(self.selected_item, QGraphicsPixmapItem) or not hasattr(self.selected_item, 'pil_original_image'):
+            return
+
+        item = self.selected_item
+        desired_width = self.image_width_spinbox.value()
+        desired_height = self.image_height_spinbox.value()
+
+        final_width = max(desired_width, MIN_SHAPE_SIZE) # Constrain the other dimension too
+        final_height = max(desired_height, MIN_SHAPE_SIZE)
+
+        original_pixmap = item.pixmap()
+        original_pixmap_width = original_pixmap.width()
+        original_pixmap_height = original_pixmap.height()
+
+        if original_pixmap_width == 0 or original_pixmap_height == 0:
+            self.image_width_spinbox.blockSignals(True)
+            self.image_height_spinbox.blockSignals(True)
+            self.image_width_spinbox.setValue(max(int(item.boundingRect().width()), int(MIN_SHAPE_SIZE)))
+            self.image_height_spinbox.setValue(max(int(item.boundingRect().height()), int(MIN_SHAPE_SIZE)))
+            self.image_width_spinbox.blockSignals(False)
+            self.image_height_spinbox.blockSignals(False)
+            return
+
+        scale_x = final_width / original_pixmap_width
+        scale_y = final_height / original_pixmap_height 
+
+        current_rotation = item.rotation()
+        transform = QTransform().scale(scale_x, scale_y).rotate(current_rotation)
+        item.setTransform(transform)
+
+        self._update_resize_handles_for_item(item)
+        
+        self.image_width_spinbox.blockSignals(True)
+        self.image_width_spinbox.setValue(int(round(final_width)))
+        self.image_width_spinbox.blockSignals(False)
+
+        self.image_height_spinbox.blockSignals(True)
+        self.image_height_spinbox.setValue(int(round(final_height)))
+        self.image_height_spinbox.blockSignals(False)
+        
+        self.scene.update()
+
+    def _update_image_size_spinboxes(self, item_or_none):
+        """Helper to update spinboxes from item's current state, primarily for selection and after mouse resize."""
+        if item_or_none and isinstance(item_or_none, QGraphicsPixmapItem) and self.image_width_spinbox.isVisible():
+            item = item_or_none
+            pixmap_w = item.pixmap().width()
+            pixmap_h = item.pixmap().height()
+            
+            content_w, content_h = MIN_SHAPE_SIZE, MIN_SHAPE_SIZE # Defaults
+
+            if pixmap_w > 0 and pixmap_h > 0:
+                # Use item.scale() which reflects uniform scaling (typically from mouse resize)
+                # If item.transform() was set with non-uniform scale, item.scale() might be 1.0 or less informative.
+                # In such a case, the spinboxes would have been the last source of truth for content size.
+                # This method is for refreshing on selection or after a uniform (mouse) scale.
+                s = item.scale() 
+                calculated_w = pixmap_w * s
+                calculated_h = pixmap_h * s
+                
+                # If the transform is non-identity and suggests non-uniform scaling not captured by item.scale(),
+                # it's hard to perfectly get back to the "intended content size" without storing it explicitly.
+                # For now, rely on item.scale() for this refresh.
+                content_w = max(calculated_w, MIN_SHAPE_SIZE)
+                content_h = max(calculated_h, MIN_SHAPE_SIZE)
+            else: # Pixmap has no dimensions
+                # If item has a bounding rect (e.g. it was a shape converted to pixmap badly)
+                brect = item.boundingRect()
+                content_w = max(brect.width(), MIN_SHAPE_SIZE)
+                content_h = max(brect.height(), MIN_SHAPE_SIZE)
+
+            self.image_width_spinbox.blockSignals(True)
+            self.image_height_spinbox.blockSignals(True)
+            self.image_width_spinbox.setValue(int(round(content_w)))
+            self.image_height_spinbox.setValue(int(round(content_h)))
+            self.image_width_spinbox.blockSignals(False)
+            self.image_height_spinbox.blockSignals(False)
+        elif not item_or_none and self.image_width_spinbox.isVisible(): 
+            self.image_width_spinbox.blockSignals(True)
+            self.image_height_spinbox.blockSignals(True)
+            self.image_width_spinbox.setValue(self.image_width_spinbox.minimum() if self.image_width_spinbox.minimum() > 0 else 1) 
+            self.image_height_spinbox.setValue(self.image_height_spinbox.minimum() if self.image_height_spinbox.minimum() > 0 else 1)
+            self.image_width_spinbox.blockSignals(False)
+            self.image_height_spinbox.blockSignals(False)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

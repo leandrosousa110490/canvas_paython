@@ -4,14 +4,21 @@ A Figma-like canvas application built with Python and the Qt framework (PySide6)
 
 ## Features
 
-*   Drawing tools: Rectangle, Ellipse, Line, Pen
+*   Drawing tools: Rectangle, Ellipse, Line, Pen, Triangle
 *   Selection and transformation of shapes (move, resize)
+    *   Rotation for all item types (shapes, lines, images, pen strokes)
 *   Image import and manipulation:
     *   Add images from local files
-    *   Move, resize, delete images
+    *   Move, resize (proportionally with mouse, independently via properties panel), rotate, delete images
     *   Remove image background (using `rembg`)
     *   Brightness adjustment
-    *   Image cropping (work in progress)
+    *   Image cropping
+    *   Save image with all transformations and effects applied
+*   Z-Ordering:
+    *   Bring to Front
+    *   Send to Back
+    *   Bring Forward
+    *   Send Backward
 *   Theming: Light and Dark modes
 *   Canvas:
     *   Zoom (mouse wheel, buttons)
