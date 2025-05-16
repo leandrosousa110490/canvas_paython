@@ -7,8 +7,8 @@ from PySide6.QtWidgets import (
     QMenuBar, QSlider, QSpinBox, QGraphicsPathItem, QGraphicsPolygonItem, QHBoxLayout, QStyleOptionGraphicsItem,
     QGraphicsItemGroup, QGraphicsSimpleTextItem # Added QGraphicsItemGroup and QGraphicsSimpleTextItem
 )
-from PySide6.QtGui import QAction, QIcon, QColor, QPainter, QPen, QBrush, QImage, QPixmap, QPainterPath, QPolygonF, QTransform # Added QTransform
-from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, QBuffer
+from PySide6.QtGui import QAction, QIcon, QColor, QPainter, QPen, QBrush, QImage, QPixmap, QPainterPath, QPolygonF, QTransform, QUndoStack, QUndoCommand, QKeySequence # Added QKeySequence
+from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, QBuffer # QKeySequence removed from here
 
 # Import for background removal
 from PIL import Image, ImageEnhance # Added ImageEnhance
@@ -103,6 +103,40 @@ def pil_to_qimage(pil_image):
     data = pil_image.tobytes("raw", "RGBA")
     qimage = QImage(data, pil_image.size[0], pil_image.size[1], QImage.Format.Format_RGBA8888)
     return qimage.copy() # Return a copy to avoid issues with data lifetime
+
+# --- Undo Commands ---
+class AddItemCommand(QUndoCommand):
+    def __init__(self, item, scene, description="Add Item"):
+        super().__init__(description)
+        self.item = item
+        self.scene = scene
+        # redo() is called implicitly by QUndoStack when command is pushed first time.
+        # So item should not be added to scene before command is pushed.
+
+    def undo(self):
+        # The scene will emit selectionChanged if the removed item was selected.
+        # on_scene_selection_changed in CanvasWindow should handle UI updates.
+        self.scene.removeItem(self.item)
+        # self.scene.update() # removeItem should handle necessary updates.
+        self.setText(f"Undo {self.itemDataText()}") 
+
+    def redo(self):
+        self.scene.addItem(self.item)
+        # Setting selected=True will also trigger scene.selectionChanged.
+        self.item.setSelected(True)
+        # self.scene.update() # addItem and setSelected should handle updates.
+        self.setText(f"Redo {self.itemDataText()}") 
+
+    def itemDataText(self):
+        # Helper for more descriptive text based on item type
+        if isinstance(self.item, QGraphicsRectItem): return "Rectangle"
+        if isinstance(self.item, QGraphicsEllipseItem): return "Ellipse"
+        if isinstance(self.item, QGraphicsLineItem): return "Line"
+        if isinstance(self.item, QGraphicsPolygonItem): return "Triangle"
+        if isinstance(self.item, QGraphicsPathItem): return "Pen Stroke"
+        if isinstance(self.item, QGraphicsPixmapItem): return "Image"
+        if isinstance(self.item, QGraphicsItemGroup): return "Table" # For pasted tables
+        return "Item"
 
 class CustomGraphicsView(QGraphicsView):
     def __init__(self, scene, parent_window):
@@ -503,7 +537,11 @@ class CustomGraphicsView(QGraphicsView):
                 final_item.setPen(pen)
                 final_item.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable)
                 final_item.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable)
-                self.scene().addItem(final_item)
+                # self.scene().addItem(final_item) # Old direct add
+                command = AddItemCommand(final_item, self.scene(), f"Add {AddItemCommand(final_item, self.scene()).itemDataText()}")
+                self.parent_window.undo_stack.push(command)
+                # The redo() of the command will select it.
+
             self.start_pos_scene = None 
             return # Handled drawing release
         elif tool == "eraser" and event.button() == Qt.MouseButton.LeftButton:
@@ -518,7 +556,10 @@ class CustomGraphicsView(QGraphicsView):
             self.current_drawing_path_item.setFlag(QGraphicsPathItem.GraphicsItemFlag.ItemIsMovable)
             # Add custom attributes if needed, e.g., item_type
             self.current_drawing_path_item.item_type = "pen_stroke"
-            self.current_drawing_path_item = None # Reset for next stroke
+            # self.scene().addItem(self.current_drawing_path_item) # No, command will do it
+            command = AddItemCommand(self.current_drawing_path_item, self.scene(), "Add Pen Stroke")
+            self.parent_window.undo_stack.push(command)
+            self.current_drawing_path_item = None 
             event.accept()
             return
 
@@ -683,13 +724,16 @@ class CanvasWindow(QMainWindow):
 
         self.current_tool = "select"
         self.selected_item = None
-        self.active_resize_handles = [] # Store current active handles
-        self.zoom_factor = 1.0 # Initialize zoom factor
-        self.eraser_brush_size = 10.0 # Default eraser size
-        self.current_crop_item = None      # Item being cropped
-        self.crop_overlay_rect = None    # Visual crop rectangle QGraphicsRectItem
-        self.active_crop_handles = []    # Handles for the crop_overlay_rect
-        self.keep_image_aspect_ratio_on_resize = True # New flag
+        self.active_resize_handles = [] 
+        self.zoom_factor = 1.0 
+        self.eraser_brush_size = 10.0 
+        self.current_crop_item = None      
+        self.crop_overlay_rect = None    
+        self.active_crop_handles = []    
+        self.keep_image_aspect_ratio_on_resize = True 
+
+        # --- Undo Stack ---
+        self.undo_stack = QUndoStack(self)
 
         self.themes = {"light": LIGHT_THEME, "dark": DARK_THEME}
         self.current_theme_name = "dark" # Default theme set to dark
@@ -846,6 +890,21 @@ class CanvasWindow(QMainWindow):
         save_image_as_action.triggered.connect(self.save_selected_image_as)
         file_menu.addAction(save_image_as_action)
 
+        # --- Edit Menu (for Undo/Redo) ---
+        edit_menu = menubar.addMenu("Edit")
+        undo_action = self.undo_stack.createUndoAction(self, "&Undo")
+        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        edit_menu.addAction(undo_action)
+
+        redo_action = self.undo_stack.createRedoAction(self, "&Redo")
+        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        edit_menu.addAction(redo_action)
+
+        # Add Undo/Redo to toolbar for quick access
+        self.toolbar.addSeparator()
+        self.toolbar.addAction(undo_action)
+        self.toolbar.addAction(redo_action)
+
         # --- Properties Panel ---
         self.properties_dock = QDockWidget("Properties", self)
         self.properties_widget = QWidget()
@@ -987,32 +1046,52 @@ class CanvasWindow(QMainWindow):
         self.apply_theme(self.current_theme_name) # Apply initial theme
 
     def on_scene_selection_changed(self):
-        selected_items = self.scene.selectedItems()
-        self._remove_resize_handles() # Clear old handles first
+        try:
+            # A very basic check. If self.scene is None, we can't proceed.
+            if not hasattr(self, 'scene') or self.scene is None:
+                print("on_scene_selection_changed: self.scene is None or not available.")
+                return
 
-        old_selected_item = self.selected_item # Keep track of previously selected item
+            selected_items = self.scene.selectedItems() 
+            self._remove_resize_handles() 
 
-        if selected_items:
-            self.selected_item = selected_items[0] 
-            if isinstance(self.selected_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem)):
-                # Check if selection actually changed or if it's a re-selection of the same item
-                # or if the item was modified (e.g. resized by mouse, triggering selection change signals)
-                # Forcing handle update here is good if item was modified.
-                self._create_resize_handles_for_item(self.selected_item)
-            print(f"Selected: {self.selected_item}")
-        else:
-            self.selected_item = None
-            print("Selection cleared")
+            old_selected_item = self.selected_item 
 
-        # Update properties panel. This will also call _update_image_size_spinboxes if an image is selected.
-        self._update_properties_panel_for_selection()
+            if selected_items:
+                new_selection = selected_items[0]
+                if self.selected_item != new_selection: # Selection truly changed
+                    self.selected_item = new_selection
+                # Always ensure handles are (re)created for the current single selection
+                if isinstance(self.selected_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsPixmapItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsItemGroup)):
+                    self._create_resize_handles_for_item(self.selected_item)
+                print(f"Selected: {self.selected_item}")
+            else:
+                self.selected_item = None
+                print("Selection cleared")
 
-        # If selection changed FROM an image TO something else (or nothing),
-        # and crop mode was active for that image, exit crop mode.
-        if self.current_crop_item and self.current_crop_item != self.selected_item:
-             if old_selected_item == self.current_crop_item:
-                 print("Selection changed away from item in crop mode. Cancelling crop.")
-                 self.exit_crop_mode(apply_changes=False)
+            self._update_properties_panel_for_selection()
+
+            if self.current_crop_item and self.current_crop_item != self.selected_item:
+                 if old_selected_item == self.current_crop_item:
+                     print("Selection changed away from item in crop mode. Cancelling crop.")
+                     self.exit_crop_mode(apply_changes=False)
+
+        except RuntimeError as e:
+            # Check for common messages indicating a deleted C++ object
+            error_msg = str(e).lower()
+            if "already deleted" in error_msg or "cannot call method" in error_msg or "null object" in error_msg:
+                print(f"on_scene_selection_changed: Caught RuntimeError (C++ object likely deleted): {e}")
+                # Attempt graceful cleanup or just prevent crash
+                if hasattr(self, 'selected_item'): self.selected_item = None
+                self._remove_resize_handles() # Try to clean handles
+                if hasattr(self, 'prop_label') and self.prop_label: # Ensure prop_label exists
+                    try:
+                        self.prop_label.setText("Selected: None (Error)")
+                    except RuntimeError: # prop_label might also be gone
+                        pass 
+                return
+            else:
+                raise # Re-raise other RuntimeErrors
 
     def update_shape_tool_button_text(self):
         if self.current_tool in ["rectangle", "ellipse", "line", "pen", "triangle"] and self.current_shape_tool_action:
@@ -1385,7 +1464,9 @@ class CanvasWindow(QMainWindow):
                 img_rect = image_item.boundingRect()
                 image_item.setPos(scene_center_point - QPointF(img_rect.width()/2, img_rect.height()/2))
 
-                self.scene.addItem(image_item)
+                # self.scene.addItem(image_item) # Old direct add
+                command = AddItemCommand(image_item, self.scene, "Add Image")
+                self.undo_stack.push(command)
             else:
                 print(f"Error: Could not load image from {file_path}") # Or show a QMessageBox
 
@@ -2138,8 +2219,10 @@ class CanvasWindow(QMainWindow):
             current_y += row_actual_height
         
         table_group.setPos(scene_pos)
-        self.scene.addItem(table_group)
-        table_group.setSelected(True) # Select the new table
+        # self.scene.addItem(table_group) # Old direct add
+        command = AddItemCommand(table_group, self.scene, "Paste Table")
+        self.undo_stack.push(command)
+        # table_group.setSelected(True) # AddItemCommand.redo() handles selection
         print("Table pasted successfully.")
 
 
