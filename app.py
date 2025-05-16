@@ -5,9 +5,14 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QToolBar, QDockWidget, QWidget, QVBoxLayout, QLabel, QPushButton, QRadioButton,
     QGraphicsRectItem, QGraphicsEllipseItem, QToolButton, QMenu, QColorDialog, QGraphicsLineItem, QFileDialog, QGraphicsPixmapItem, QMessageBox,
     QMenuBar, QSlider, QSpinBox, QGraphicsPathItem, QGraphicsPolygonItem, QHBoxLayout, QStyleOptionGraphicsItem,
-    QGraphicsItemGroup, QGraphicsSimpleTextItem # Added QGraphicsItemGroup and QGraphicsSimpleTextItem
+    QGraphicsItemGroup, QGraphicsSimpleTextItem, # Added QGraphicsItemGroup and QGraphicsSimpleTextItem
+    QGraphicsTextItem, QFontComboBox # Added QFontComboBox
 )
-from PySide6.QtGui import QAction, QIcon, QColor, QPainter, QPen, QBrush, QImage, QPixmap, QPainterPath, QPolygonF, QTransform, QUndoStack, QUndoCommand, QKeySequence # Added QKeySequence
+from PySide6.QtGui import (
+    QAction, QIcon, QColor, QPainter, QPen, QBrush, QImage, QPixmap, 
+    QPainterPath, QPolygonF, QTransform, QUndoStack, QUndoCommand, QKeySequence,
+    QFont # Added QFont
+)
 from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, QBuffer # QKeySequence removed from here
 
 # Import for background removal
@@ -136,6 +141,7 @@ class AddItemCommand(QUndoCommand):
         if isinstance(self.item, QGraphicsPathItem): return "Pen Stroke"
         if isinstance(self.item, QGraphicsPixmapItem): return "Image"
         if isinstance(self.item, QGraphicsItemGroup): return "Table" # For pasted tables
+        if isinstance(self.item, QGraphicsTextItem): return "Text Item"
         return "Item"
 
 class CustomGraphicsView(QGraphicsView):
@@ -235,6 +241,28 @@ class CustomGraphicsView(QGraphicsView):
                 painter_path = QPainterPath()
                 painter_path.moveTo(self.start_pos_scene)
                 self.current_drawing_path_item.setPath(painter_path)
+                event.accept()
+                return
+            elif tool == "text": # Handle text tool press
+                # Create QGraphicsTextItem at the click position
+                text_item = QGraphicsTextItem()
+                text_item.setPlainText("Type here...") # Default text
+                text_item.setPos(self.start_pos_scene)
+                text_item.setDefaultTextColor(self.parent_window.current_theme_colors["text_color"])
+                # text_item.setFont(...) # TODO: Add font selection later
+                
+                text_item.setFlag(QGraphicsTextItem.GraphicsItemFlag.ItemIsSelectable, True)
+                text_item.setFlag(QGraphicsTextItem.GraphicsItemFlag.ItemIsMovable, True)
+                text_item.setTextInteractionFlags(Qt.TextEditorInteraction.TextEditorInteraction) # Make it editable
+
+                command = AddItemCommand(text_item, self.scene(), "Add Text")
+                self.parent_window.undo_stack.push(command)
+                # AddItemCommand.redo() will select it. It also focuses it for editing.
+                # text_item.setFocus(Qt.FocusReason.MouseFocusReason) # Ensure it gets focus to start typing
+                # The focus should be set after it's added and selected by the command's redo.
+                # We can connect to the command's redo completion if needed, or just let selection handle focus if Qt does.
+                # For now, relying on selection from AddItemCommand to potentially give focus.
+                # If direct editing isn't triggered, we might need to explicitly call setFocus later.
                 event.accept()
                 return
             # For drawing tools, start_pos_scene is already set, handled in move/release
@@ -794,7 +822,10 @@ class CanvasWindow(QMainWindow):
         triangle_action = QAction("Triangle", self)
         triangle_action.triggered.connect(lambda: self.set_tool("triangle"))
         self.shape_menu.addAction(triangle_action)
-        # Add more shape actions here later
+
+        text_tool_action = QAction("Text", self)
+        text_tool_action.triggered.connect(lambda: self.set_tool("text"))
+        self.shape_menu.addAction(text_tool_action)
 
         self.shape_tool_button.setMenu(self.shape_menu)
         self.toolbar.addWidget(self.shape_tool_button)
@@ -1003,6 +1034,30 @@ class CanvasWindow(QMainWindow):
         self.save_image_button.clicked.connect(self.save_selected_image_as)
         self.properties_layout.addWidget(self.save_image_button)
 
+        # --- Text Color Controls (New) ---
+        self.text_color_label = QLabel("Text Color:")
+        self.properties_layout.addWidget(self.text_color_label)
+        self.change_text_color_button = QPushButton("Change Text Color")
+        self.change_text_color_button.clicked.connect(self.change_selected_item_text_color)
+        self.properties_layout.addWidget(self.change_text_color_button)
+        self.current_text_color_preview = QLabel("● Text") # Placeholder, will be styled
+        self.properties_layout.addWidget(self.current_text_color_preview)
+
+        # --- Font Family and Size Controls (New) ---
+        self.font_family_label = QLabel("Font Family:")
+        self.properties_layout.addWidget(self.font_family_label)
+        self.font_family_combo = QFontComboBox(self)
+        self.font_family_combo.currentFontChanged.connect(self.on_selected_item_font_family_changed)
+        self.properties_layout.addWidget(self.font_family_combo)
+
+        self.font_size_label = QLabel("Font Size:")
+        self.properties_layout.addWidget(self.font_size_label)
+        self.font_size_spinbox = QSpinBox(self)
+        self.font_size_spinbox.setRange(1, 200) # Min 1pt, Max 200pt
+        self.font_size_spinbox.setValue(10) # Default initial value
+        self.font_size_spinbox.editingFinished.connect(self.on_selected_item_font_size_editing_finished) # Use editingFinished
+        self.properties_layout.addWidget(self.font_size_spinbox)
+
         # Pen Tool Properties (visible when pen tool is active)
         self.pen_color_label = QLabel("Pen Color:")
         self.properties_layout.addWidget(self.pen_color_label)
@@ -1020,7 +1075,10 @@ class CanvasWindow(QMainWindow):
         self.pen_width_spinbox.setValue(int(self.current_pen_width))
         self.pen_width_spinbox.valueChanged.connect(self.on_pen_width_changed)
         self.properties_layout.addWidget(self.pen_width_spinbox)
+        
+        self.properties_layout.addStretch() # Ensure this is at the end of adding property widgets
 
+        # Initial visibility states for properties
         self.brightness_label.setVisible(False)
         self.brightness_slider.setVisible(False)
         self.brightness_value_label.setVisible(False)
@@ -1035,7 +1093,16 @@ class CanvasWindow(QMainWindow):
         self.current_pen_color_preview.setVisible(False)
         self.pen_width_label.setVisible(False)
         self.pen_width_spinbox.setVisible(False)
-        
+        self.text_color_label.setVisible(False)
+        self.change_text_color_button.setVisible(False)
+        self.current_text_color_preview.setVisible(False)
+
+        # Hide new font controls by default
+        self.font_family_label.setVisible(False)
+        self.font_family_combo.setVisible(False)
+        self.font_size_label.setVisible(False)
+        self.font_size_spinbox.setVisible(False)
+
         self.properties_layout.addStretch() # Pushes controls to the top
         self.properties_dock.setWidget(self.properties_widget)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.properties_dock)
@@ -1094,7 +1161,7 @@ class CanvasWindow(QMainWindow):
                 raise # Re-raise other RuntimeErrors
 
     def update_shape_tool_button_text(self):
-        if self.current_tool in ["rectangle", "ellipse", "line", "pen", "triangle"] and self.current_shape_tool_action:
+        if self.current_tool in ["rectangle", "ellipse", "line", "pen", "triangle", "text"] and self.current_shape_tool_action:
             self.shape_tool_button.setText(self.current_shape_tool_action.text())
         else:
             # Default or if a non-shape tool is active but we want to show last shape
@@ -1119,7 +1186,7 @@ class CanvasWindow(QMainWindow):
             # If user cancels, current_pen_color remains as it was
 
         # Uncheck main tools if a shape tool is selected from dropdown
-        if tool_name in ["rectangle", "ellipse", "line", "pen", "triangle"]:
+        if tool_name in ["rectangle", "ellipse", "line", "pen", "triangle", "text"]:
             for action in self.main_tool_actions_group:
                 action.setChecked(False)
             # Update current_shape_tool_action based on tool_name
@@ -1127,11 +1194,15 @@ class CanvasWindow(QMainWindow):
             elif tool_name == "ellipse": self.current_shape_tool_action = self.shape_menu.actions()[1]
             elif tool_name == "line": self.current_shape_tool_action = self.shape_menu.actions()[2]
             elif tool_name == "pen": self.current_shape_tool_action = self.shape_menu.actions()[3]
-            elif tool_name == "triangle": self.current_shape_tool_action = self.shape_menu.actions()[4] # Assuming Triangle is 5th
+            elif tool_name == "triangle": self.current_shape_tool_action = self.shape_menu.actions()[4] 
+            elif tool_name == "text": self.current_shape_tool_action = self.shape_menu.actions()[5] # Assuming Text is 6th
             self.update_shape_tool_button_text()
             self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
-            self.view.setInteractive(False) # Drawing tools manage interaction
-            self.view.setCursor(Qt.CursorShape.CrossCursor) # Standard for drawing
+            self.view.setInteractive(False) # Drawing/Text tools manage interaction
+            if tool_name == "text":
+                self.view.setCursor(Qt.CursorShape.IBeamCursor)
+            else:
+                self.view.setCursor(Qt.CursorShape.CrossCursor) # Standard for drawing
         else: # Select, Hand, or Eraser tool
             for action in self.main_tool_actions_group:
                 if action.text().lower().startswith(tool_name.lower()): # Match tool_name (e.g. "select", "hand", "eraser")
@@ -1240,6 +1311,9 @@ class CanvasWindow(QMainWindow):
         self.current_pen_color_preview.setVisible(False)
         self.pen_width_label.setVisible(False)
         self.pen_width_spinbox.setVisible(False)
+        self.text_color_label.setVisible(False)
+        self.change_text_color_button.setVisible(False)
+        self.current_text_color_preview.setVisible(False)
 
         # Hide new image controls initially
         self.image_size_label.setVisible(False)
@@ -1260,7 +1334,8 @@ class CanvasWindow(QMainWindow):
             is_line = isinstance(item, QGraphicsLineItem)
             is_pen_stroke = isinstance(item, QGraphicsPathItem) and hasattr(item, 'item_type') and item.item_type == 'pen_stroke'
             is_managed_image = isinstance(item, QGraphicsPixmapItem) and hasattr(item, 'pil_original_image')
-            can_rotate = isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsPixmapItem))
+            can_rotate = isinstance(item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsPixmapItem, QGraphicsItemGroup))
+            is_text_item = isinstance(item, QGraphicsTextItem)
 
             if can_fill_outline:
                 item_type_str = "Shape" # Generic shape, can be refined
@@ -1366,6 +1441,43 @@ class CanvasWindow(QMainWindow):
                 self.apply_crop_button.setVisible(False)
                 self.cancel_crop_button.setVisible(False)
 
+            if is_text_item:
+                item_type_str = "Text"
+                self.text_color_label.setVisible(True)
+                self.change_text_color_button.setVisible(True)
+                current_color = item.defaultTextColor()
+                self.current_text_color_preview.setText(f"Color: {current_color.name()}")
+                self.current_text_color_preview.setStyleSheet(f"background-color: {current_color.name()}; color: {self.get_contrasting_text_color(current_color, theme_colors).name()}")
+                
+                self.font_family_label.setVisible(True)
+                self.font_family_combo.setVisible(True)
+                self.font_size_label.setVisible(True)
+                self.font_size_spinbox.setVisible(True)
+
+                current_font = item.font()
+                self.font_family_combo.blockSignals(True)
+                self.font_family_combo.setCurrentFont(current_font)
+                self.font_family_combo.blockSignals(False)
+
+                self.font_size_spinbox.blockSignals(True)
+                self.font_size_spinbox.setValue(current_font.pointSize() if current_font.pointSize() > 0 else 10) # Default to 10 if pointSize is 0 or -1
+                self.font_size_spinbox.blockSignals(False)
+
+                # Hide other properties not relevant to simple text item for now
+                self.fill_color_button.setVisible(False)
+                self.current_fill_color_label.setVisible(False)
+                self.outline_color_button.setVisible(False)
+                self.current_outline_color_label.setVisible(False)
+            else: # Not a text item, ensure text controls are hidden
+                self.text_color_label.setVisible(False)
+                self.change_text_color_button.setVisible(False)
+                self.current_text_color_preview.setVisible(False)
+                # Also hide font controls if no selection
+                self.font_family_label.setVisible(False)
+                self.font_family_combo.setVisible(False)
+                self.font_size_label.setVisible(False)
+                self.font_size_spinbox.setVisible(False)
+
             self.prop_label.setText(f"Selected: {item_type_str}")
 
         else: # No item selected
@@ -1374,6 +1486,10 @@ class CanvasWindow(QMainWindow):
             self.current_fill_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()}; background-color: transparent;")
             self.current_outline_color_label.setText("Outline: N/A")
             self.current_outline_color_label.setStyleSheet(f"color: {theme_colors['text_color'].name()}; background-color: transparent;")
+            # Ensure text item specific properties are hidden as well if no selection
+            self.text_color_label.setVisible(False)
+            self.change_text_color_button.setVisible(False)
+            self.current_text_color_preview.setVisible(False)
 
             # Show pen tool's global properties if pen tool is active
             if self.current_tool == "pen":
@@ -1832,7 +1948,7 @@ class CanvasWindow(QMainWindow):
             print(f"Selected stroke width changed to: {new_width}")
 
     def on_rotation_slider_changed(self, value):
-        if self.selected_item and isinstance(self.selected_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsPixmapItem)):
+        if self.selected_item and isinstance(self.selected_item, (QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsPixmapItem, QGraphicsItemGroup)):
             angle = float(value)
             self.selected_item.setRotation(angle)
             self.rotation_value_label.setText(f"{int(angle)}°")
@@ -2224,6 +2340,36 @@ class CanvasWindow(QMainWindow):
         self.undo_stack.push(command)
         # table_group.setSelected(True) # AddItemCommand.redo() handles selection
         print("Table pasted successfully.")
+
+    # --- Text Item Specific Methods ---
+    def change_selected_item_text_color(self):
+        if self.selected_item and isinstance(self.selected_item, QGraphicsTextItem):
+            current_color = self.selected_item.defaultTextColor()
+            new_color = QColorDialog.getColor(current_color, self, "Choose Text Color")
+            if new_color.isValid():
+                # TODO: Make this undoable with a ChangePropertyCommand
+                self.selected_item.setDefaultTextColor(new_color)
+                self._update_properties_panel_for_selection() # Update display
+                self.selected_item.update() # Ensure repaint
+
+    def on_selected_item_font_family_changed(self, font):
+        if self.selected_item and isinstance(self.selected_item, QGraphicsTextItem):
+            # We want to change the family, but keep other aspects like size if possible
+            current_item_font = self.selected_item.font()
+            current_item_font.setFamily(font.family())
+            # TODO: Make this undoable
+            self.selected_item.setFont(current_item_font)
+            self._update_properties_panel_for_selection() # Refresh size display if it changed due to family
+
+    def on_selected_item_font_size_editing_finished(self):
+        if self.selected_item and isinstance(self.selected_item, QGraphicsTextItem):
+            new_size = self.font_size_spinbox.value()
+            current_item_font = self.selected_item.font()
+            current_item_font.setPointSize(new_size)
+            # TODO: Make this undoable
+            self.selected_item.setFont(current_item_font)
+            # No need to call _update_properties_panel_for_selection here as spinbox already has the value
+            # self.selected_item.update() #setFont should trigger update
 
 
 if __name__ == "__main__":
