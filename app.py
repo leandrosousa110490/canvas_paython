@@ -614,12 +614,21 @@ class CustomGraphicsView(QGraphicsView):
 
         # Check if there is text on the clipboard
         clipboard = QApplication.clipboard()
-        has_text_on_clipboard = clipboard.mimeData().hasText()
+        mime_data = clipboard.mimeData() # Store mimeData
+        has_text_on_clipboard = mime_data.hasText()
+        has_image_on_clipboard = mime_data.hasImage() # Check for image
 
         paste_table_action = QAction("Paste Table", self)
         paste_table_action.setEnabled(has_text_on_clipboard)
         paste_table_action.triggered.connect(lambda: self.parent_window.paste_table_from_clipboard(scene_pos))
         menu.addAction(paste_table_action)
+
+        # --- Add Paste Image Action ---
+        paste_image_action = QAction("Paste Image", self)
+        paste_image_action.setEnabled(has_image_on_clipboard)
+        paste_image_action.triggered.connect(lambda: self.parent_window.paste_image_from_clipboard(scene_pos))
+        menu.addAction(paste_image_action)
+        # --- End Paste Image Action ---
 
         # Show the context menu at the event position
         menu.exec(event.globalPos())
@@ -2370,6 +2379,44 @@ class CanvasWindow(QMainWindow):
             self.selected_item.setFont(current_item_font)
             # No need to call _update_properties_panel_for_selection here as spinbox already has the value
             # self.selected_item.update() #setFont should trigger update
+
+    # --- Clipboard Image Pasting Method (New) ---
+    def paste_image_from_clipboard(self, scene_pos):
+        clipboard = QApplication.clipboard()
+        q_image = clipboard.image() # Fetches QImage directly
+
+        if q_image.isNull():
+            QMessageBox.information(self, "Paste Error", "No image data found on clipboard or image format not supported.")
+            return
+
+        pixmap = QPixmap.fromImage(q_image)
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Paste Error", "Could not convert clipboard image to a usable format.")
+            return
+
+        image_item = QGraphicsPixmapItem(pixmap)
+        image_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable, True)
+        image_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, True)
+
+        # Store PIL image versions and properties for consistency
+        pil_img_original = qimage_to_pil(q_image) # Use the original q_image for highest fidelity
+        image_item.pil_original_image = pil_img_original
+        image_item.pil_after_bg_removal = None
+        image_item.pil_for_display = pil_img_original.copy()
+        image_item.current_brightness_factor = 1.0
+        # Ensure pixmap on item reflects pil_for_display (it should, but good for consistency)
+        # image_item.setPixmap(QPixmap.fromImage(pil_to_qimage(image_item.pil_for_display)))
+        # The pixmap is already set from clipboard's QImage, which should be fine.
+
+        # Position the image at the paste location (scene_pos is the click point)
+        # Center the image on the click point
+        img_rect = image_item.boundingRect()
+        image_item.setPos(scene_pos - QPointF(img_rect.width() / 2, img_rect.height() / 2))
+
+        command = AddItemCommand(image_item, self.scene, "Paste Image")
+        self.undo_stack.push(command)
+        # AddItemCommand.redo() will select the item
+        print("Image pasted from clipboard.")
 
 
 if __name__ == "__main__":
